@@ -6,11 +6,12 @@ import matplotlib.pyplot as plt
 from NeuralNetwork import StockPriceNeuralNetwork, train_loop, test_loop
 
 #Rules
-N_EPOCHS = 100
+N_EPOCHS = 10000
 BATCH_SIZE = 128
-LEARNING_RATE = 0.02
+LEARNING_RATE = 0.002
 PATH = kagglehub.dataset_download("mattiuzc/stock-exchange-data")
 PATH += "/indexProcessed.csv"
+# TODO: add gpu acceleration
 # DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 # print(f"Using {DEVICE} device")
 # torch.set_default_device(DEVICE)
@@ -19,6 +20,7 @@ PATH += "/indexProcessed.csv"
 #Preprocessing
 #Params shape n * 30 days * 9 columns on csv
 #Y: the adj close value of next month: n+1 * first day
+# TODO: normalization of values, improve scaling and make Y percentual advances not absolute values
 
 df = pd.read_csv(PATH)
 df = df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]]
