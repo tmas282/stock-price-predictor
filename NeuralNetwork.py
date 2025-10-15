@@ -1,15 +1,61 @@
+import torch
 from torch import nn
-class NeuralNetwork(nn.Module):
+from torch import optim
+import numpy as np
+
+loss_fn = nn.MSELoss()
+
+class StockPriceNeuralNetwork(nn.Module):
     def __init__(self):
         super().__init__()
         self.non_linear_Sequential = nn.Sequential(
-            nn.Linear(512, 128),
+            nn.Flatten(),
+            nn.Linear(210, 64),
             nn.ReLU(),
-            nn.Linear(128, 32),
+            nn.Linear(64, 16),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(16, 1),
         )
         pass
     def forward(self, x):
-        y = nn.non_linear_Sequential
+        y = self.non_linear_Sequential(x)
         return y
+
+def train_loop(dataloader: torch.utils.data.DataLoader, model: nn.Module, batch_size=64, learning_rate=1e-3):
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    size = len(dataloader)
+    model.train()
+    for batch, (X, y) in enumerate(dataloader):
+        # Compute prediction and loss
+        pred = model(X)
+        y = np.reshape(y, (-1, 1))
+        loss = loss_fn(pred, y)
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if batch % 100 == 0:
+            loss, current = loss.item(), batch * batch_size + len(X)
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+def test_loop(dataloader: torch.utils.data.DataLoader, model: nn.Module):
+    # Set the model to evaluation mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    model.eval()
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
+    test_loss, correct = 0, 0
+
+    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
+    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
+    with torch.no_grad():
+        for X, y in dataloader:
+            pred = model(X)
+            test_loss += loss_fn(pred, y).item()
+            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+
+    test_loss /= num_batches
+    correct /= size
+    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
