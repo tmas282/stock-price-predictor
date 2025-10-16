@@ -10,7 +10,7 @@ class StockPriceNeuralNetwork(nn.Module):
         super().__init__()
         self.non_linear_Sequential = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(210, 64),
+            nn.Linear(30 * 6, 64),
             nn.ReLU(),
             nn.Linear(64, 16),
             nn.ReLU(),
