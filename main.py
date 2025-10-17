@@ -16,11 +16,10 @@ N_EPOCHS = 100
 BATCH_SIZE = 128
 LEARNING_RATE = 0.002
 PATH += "/indexProcessed.csv"
-# TODO: add gpu acceleration
-# DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-# print(f"Using {DEVICE} device")
-# torch.set_default_device(DEVICE)
-# torch.set_default_dtype(torch.float32)
+DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+print(f"Using {DEVICE} device")
+torch.set_default_device(DEVICE)
+torch.set_default_dtype(torch.float32)
 
 #Preprocessing
 #Params shape n * 30 days * 6 columns on csv
@@ -65,15 +64,15 @@ print(f"Dataframe shape: {np.shape(split_time_series)}"
       f"\nTrain shape: {np.shape(train_X)} Validate shape: {np.shape(test_X)}"
       f"\nTrain Y shape: {np.shape(train_Y)} Validate Y shape: {np.shape(test_Y)}")
 
-train_X = torch.from_numpy(train_X).to(dtype=torch.float32)#.to(DEVICE)
-train_Y = torch.from_numpy(train_Y).to(dtype=torch.float32)#.to(DEVICE)
-test_X = torch.from_numpy(test_X).to(dtype=torch.float32)#.to(DEVICE)
-test_Y = torch.from_numpy(test_Y).to(dtype=torch.float32)#.to(DEVICE)
+train_X = torch.from_numpy(train_X).to(dtype=torch.float32).to(DEVICE)
+train_Y = torch.from_numpy(train_Y).to(dtype=torch.float32).to(DEVICE)
+test_X = torch.from_numpy(test_X).to(dtype=torch.float32).to(DEVICE)
+test_Y = torch.from_numpy(test_Y).to(dtype=torch.float32).to(DEVICE)
 
 train_set = torch.utils.data.TensorDataset(train_X, train_Y)
-train_dataloader = torch.utils.data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)#, generator=torch.Generator(device=DEVICE))
+train_dataloader = torch.utils.data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, generator=torch.Generator(device=DEVICE))
 test_set = torch.utils.data.TensorDataset(test_X, test_Y)
-test_dataloader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=True)#, generator=torch.Generator(device=DEVICE))
+test_dataloader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=True, generator=torch.Generator(device=DEVICE))
 
 #Model
 model = StockPriceNeuralNetwork()
