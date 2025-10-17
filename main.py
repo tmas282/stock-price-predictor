@@ -20,6 +20,12 @@ DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_av
 print(f"Using {DEVICE} device")
 torch.set_default_device(DEVICE)
 torch.set_default_dtype(torch.float32)
+MODEL = StockPriceNeuralNetwork()
+model_loaded = True
+try:
+    MODEL.load_state_dict(torch.load('model.obj', weights_only=True))
+except:
+    model_loaded = False
 
 #Preprocessing
 #Params shape n * 30 days * 6 columns on csv
@@ -70,10 +76,14 @@ train_dataloader = torch.utils.data.DataLoader(train_set, batch_size=BATCH_SIZE,
 test_set = torch.utils.data.TensorDataset(test_X, test_Y)
 test_dataloader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=True, generator=torch.Generator(device=DEVICE))
 
-#Model
-model = StockPriceNeuralNetwork()
-for t in range(N_EPOCHS):
-    print(f"Epoch {t}\n-------------------------------")
-    model.train_loop(train_dataloader, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
-    model.test_loop(test_dataloader)
+#Training
+if not model_loaded:
+    for t in range(N_EPOCHS):
+        print(f"Epoch {t}\n-------------------------------")
+        MODEL.train_loop(train_dataloader, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
+        MODEL.test_loop(test_dataloader)
+    torch.save(MODEL.state_dict(), 'model.obj')
+    print("Neural Network training session saved")
+else:
+    print("Neural Network loaded")
 
