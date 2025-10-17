@@ -9,7 +9,7 @@ try:
     import kagglehub
     PATH = kagglehub.dataset_download("mattiuzc/stock-exchange-data")
 except:
-    print("Unable to get dataset, trying cache...")
+    print("Unable to get training dataset, trying cache...")
     PATH = f"{Path.home()}/.cache/kagglehub/datasets/mattiuzc/stock-exchange-data/versions/2"
 #Rules
 N_EPOCHS = 100
