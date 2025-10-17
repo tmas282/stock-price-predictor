@@ -3,13 +3,13 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from NeuralNetwork import StockPriceNeuralNetwork, train_loop, test_loop
-
+from NeuralNetwork import StockPriceNeuralNetwork
 #dataset path
 try:
     import kagglehub
     PATH = kagglehub.dataset_download("mattiuzc/stock-exchange-data")
 except:
+    print("Unable to get dataset, trying cache...")
     PATH = f"{Path.home()}/.cache/kagglehub/datasets/mattiuzc/stock-exchange-data/versions/2"
 #Rules
 N_EPOCHS = 100
@@ -60,10 +60,6 @@ for v in split_time_series[split_breakpoint+1:]:
     m += 1
 test_Y[m] = uncomplete_month["Close"].tolist()[0]
 
-print(f"Dataframe shape: {np.shape(split_time_series)}"
-      f"\nTrain shape: {np.shape(train_X)} Validate shape: {np.shape(test_X)}"
-      f"\nTrain Y shape: {np.shape(train_Y)} Validate Y shape: {np.shape(test_Y)}")
-
 train_X = torch.from_numpy(train_X).to(dtype=torch.float32).to(DEVICE)
 train_Y = torch.from_numpy(train_Y).to(dtype=torch.float32).to(DEVICE)
 test_X = torch.from_numpy(test_X).to(dtype=torch.float32).to(DEVICE)
@@ -78,6 +74,6 @@ test_dataloader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE, s
 model = StockPriceNeuralNetwork()
 for t in range(N_EPOCHS):
     print(f"Epoch {t}\n-------------------------------")
-    train_loop(train_dataloader, model, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
-    test_loop(test_dataloader, model)
+    model.train_loop(train_dataloader, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
+    model.test_loop(test_dataloader)
 
