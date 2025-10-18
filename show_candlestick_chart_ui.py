@@ -15,7 +15,7 @@ def show_dataframe_and_prediction(df: pd.DataFrame, prediction: float, stock_sym
     df.set_index('Date', inplace=True)
     last_date = df.index[-1]
     tomorrow = last_date + pd.Timedelta(days=1)
-    title = f'Candlestick Chart {f"of {stock_symbol}" if stock_symbol is not None else ""}'
+    title = f'Candlestick Chart {f"of {stock_symbol}" if stock_symbol is not None else ""} with prediction, pointed in blue'
     fig, axlist = mpf.plot(
         df,
         type='candle',
