@@ -8,7 +8,6 @@ class StockPriceNeuralNetwork(nn.Module):
     def __init__(self):
         super().__init__()
         self.non_linear_Sequential = nn.Sequential(
-            nn.Flatten(),
             nn.Linear(30 * 6, 64),
             nn.ReLU(),
             nn.Linear(64, 16),
@@ -16,6 +15,9 @@ class StockPriceNeuralNetwork(nn.Module):
             nn.Linear(16, 1),
         )
         pass
+    def flatten(self, x):
+        f = nn.Flatten()
+        return f(x)
     def forward(self, x):
         y = self.non_linear_Sequential(x)
         return y
@@ -26,7 +28,7 @@ class StockPriceNeuralNetwork(nn.Module):
         self.train()
         for batch, (X, y) in enumerate(dataloader):
             # Compute prediction and loss
-            pred = self(X)
+            pred = self(self.flatten(X))
             pred = torch.squeeze(pred)
             loss = loss_fn(pred, y)
 
@@ -50,7 +52,7 @@ class StockPriceNeuralNetwork(nn.Module):
         # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
         with torch.no_grad():
             for X, y in dataloader:
-                pred = self(X)
+                pred = self(self.flatten(X))
                 test_loss += loss_fn(pred, y).item()
 
         test_loss /= num_batches
