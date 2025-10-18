@@ -73,3 +73,6 @@ def preprocessing_dataframe_non_usd(df: pd.DataFrame, device:str = "cpu", for_mo
         return train_X, train_Y, test_X, test_Y
     else:
         return torch.from_numpy(np.reshape(np.array(df), shape=(1, 30, 6))).to(dtype=torch.float32).to(device)
+
+def denormalize_predicted_value(y: np.float32, df: pd.DataFrame):
+    return y * (df["Close"].max() - df["Close"].min()) + df["Close"].min()
