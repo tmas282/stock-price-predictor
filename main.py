@@ -1,10 +1,13 @@
+import numpy as np
 import torch
 import pandas as pd
 from pathlib import Path
 
 from getting_data_service import get_last_month_by_symbol
 from neural_network import StockPriceNeuralNetwork
-from processing_data_service import preprocessing_dataframe, preprocessing_dataframe_non_usd
+from processing_data_service import preprocessing_dataframe, preprocessing_dataframe_non_usd, \
+    denormalize_predicted_value
+from show_candlestick_chart_ui import show_dataframe_and_prediction
 
 #dataset path
 try:
@@ -50,4 +53,7 @@ stock_symbol = input("Stock symbol (to predict): ")
 stock_df = get_last_month_by_symbol(stock_symbol)
 input_tensor = preprocessing_dataframe(stock_df, device=DEVICE, for_model_training=False)
 next_price = MODEL(MODEL.flatten(input_tensor))
-
+next_price = torch.squeeze(next_price).to("cpu").detach()
+next_price = np.float32(next_price)
+next_price = denormalize_predicted_value(next_price, stock_df)
+show_dataframe_and_prediction(stock_df, float(next_price))

@@ -30,7 +30,7 @@ def preprocessing_dataframe_non_usd(df: pd.DataFrame, device:str = "cpu", for_mo
     df = df[["Date", "Open", "High", "Low", "Close", "Volume", "CloseUSD"]]
     #Date to integer
     df["Date"] = pd.to_datetime(df["Date"])
-    df["Date"] = df.Date.dt.strftime('%Y%m%d').astype(int)
+    df["Date"] = df["Date"].dt.strftime('%Y%m%d').astype(int)
     #Values to USD
     df["Open"] = df["Open"] * df["CloseUSD"] / df["Close"]
     df["High"] = df["High"] * df["CloseUSD"] / df["Close"]
