@@ -30,7 +30,7 @@ def preprocessing_dataframe_non_usd(df: pd.DataFrame, device:str = "cpu", for_mo
     df = df[["Date", "Open", "High", "Low", "Close", "Volume", "CloseUSD"]]
     #Date to integer
     df["Date"] = pd.to_datetime(df["Date"])
-    df["Date"] = df.Date.dt.strftime('%Y%m%d').astype(int)
+    df["Date"] = df["Date"].dt.strftime('%Y%m%d').astype(int)
     #Values to USD
     df["Open"] = df["Open"] * df["CloseUSD"] / df["Close"]
     df["High"] = df["High"] * df["CloseUSD"] / df["Close"]
@@ -73,3 +73,6 @@ def preprocessing_dataframe_non_usd(df: pd.DataFrame, device:str = "cpu", for_mo
         return train_X, train_Y, test_X, test_Y
     else:
         return torch.from_numpy(np.reshape(np.array(df), shape=(1, 30, 6))).to(dtype=torch.float32).to(device)
+
+def denormalize_predicted_value(y: np.float32, df: pd.DataFrame):
+    return y * (df["Close"].max() - df["Close"].min()) + df["Close"].min()
