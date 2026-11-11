@@ -63,6 +63,16 @@ FEATURE_COLS = [
     "feat_vwap",
 ]
 
+# Target next candle prediction columns (5):
+TARGET_COLS = ["open", "high", "low", "close", "volume"]
+TARGET_DIM = len(TARGET_COLS)
+
+TARGET_OPEN_IDX = 0
+TARGET_HIGH_IDX = 1
+TARGET_LOW_IDX = 2
+TARGET_CLOSE_IDX = 3
+TARGET_VOLUME_IDX = 4
+
 
 def ensure_datetime_column(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -141,7 +151,6 @@ def compute_timeframe_features(df: pl.DataFrame, timeframe_id: float) -> pl.Data
 
         # Timeframe Tag (1.0 = 1D, 2.0 = 4H, 3.0 = 1H)
         pl.lit(timeframe_id).alias("timeframe_id"),
-        pl.col("close").alias("nominal_close")
     ]).drop_nulls()
 
     return df_featured
@@ -181,14 +190,19 @@ class MultiTimeframeDataset(Dataset):
         - 720 1-Hour (1H) candles
     
     Target:
-        - Next 1-Hour candle return vector of shape (feats=14,)
+        - Next 1-Hour candle normalized OHLCV vector of shape (5,):
+          [open, high, low, close, volume] normalized via window Min-Max [0, 1].
     """
     def __init__(
         self,
         features_1d: np.ndarray,
         features_4h: np.ndarray,
         features_1h: np.ndarray,
-        nominal_closes_1h: np.ndarray,
+        ohlcv_1h: np.ndarray,
+        win_p_min: np.ndarray,
+        win_p_range: np.ndarray,
+        win_v_min: np.ndarray,
+        win_v_range: np.ndarray,
         h1_indices: np.ndarray,
         idx_1d_map: np.ndarray,
         idx_4h_map: np.ndarray,
@@ -198,7 +212,11 @@ class MultiTimeframeDataset(Dataset):
         self.features_1d = features_1d
         self.features_4h = features_4h
         self.features_1h = features_1h
-        self.nominal_closes_1h = nominal_closes_1h
+        self.ohlcv_1h = ohlcv_1h
+        self.win_p_min = win_p_min
+        self.win_p_range = win_p_range
+        self.win_v_min = win_v_min
+        self.win_v_range = win_v_range
         self.h1_indices = h1_indices
         self.idx_1d_map = idx_1d_map
         self.idx_4h_map = idx_4h_map
@@ -212,28 +230,43 @@ class MultiTimeframeDataset(Dataset):
         d1_idx = self.idx_1d_map[i]
         h4_idx = self.idx_4h_map[i]
 
-        # 1. Slice past 180 Daily candles: shape (180, 14)
+        # 1. Slice past 180 Daily candles: shape (180, feats)
         c_1d = self.features_1d[d1_idx - LEN_1D + 1 : d1_idx + 1]
 
-        # 2. Slice past 540 4-Hour candles: shape (540, 14)
+        # 2. Slice past 540 4-Hour candles: shape (540, feats)
         c_4h = self.features_4h[h4_idx - LEN_4H + 1 : h4_idx + 1]
 
-        # 3. Slice past 720 1-Hour candles: shape (720, 14)
+        # 3. Slice past 720 1-Hour candles: shape (720, feats)
         c_1h = self.features_1h[h1_idx - LEN_1H + 1 : h1_idx + 1]
 
         # 4. Concatenate along time: Total sequence length L = 180 + 540 + 720 = 1440
         x = np.concatenate([c_1d, c_4h, c_1h], axis=0)
 
-        # 5. Target: Next 1-Hour candle return vector
-        target_next = self.features_1h[h1_idx + 1]
-        prev_close = self.nominal_closes_1h[h1_idx]
-        actual_next_close = self.nominal_closes_1h[h1_idx + 1]
+        # 5. Target: Next 1-Hour candle normalized OHLCV: [open, high, low, close, volume]
+        next_ohlcv = self.ohlcv_1h[h1_idx + 1]  # [open, high, low, close, volume]
+        p_min = self.win_p_min[h1_idx]
+        p_range = self.win_p_range[h1_idx]
+        v_min = self.win_v_min[h1_idx]
+        v_range = self.win_v_range[h1_idx]
+
+        target_next = np.empty(5, dtype=np.float32)
+        target_next[0] = (next_ohlcv[0] - p_min) / p_range  # open
+        target_next[1] = (next_ohlcv[1] - p_min) / p_range  # high
+        target_next[2] = (next_ohlcv[2] - p_min) / p_range  # low
+        target_next[3] = (next_ohlcv[3] - p_min) / p_range  # close
+        target_next[4] = (next_ohlcv[4] - v_min) / v_range  # volume
+
+        prev_close = self.ohlcv_1h[h1_idx, 3]
 
         return {
-            "x": torch.from_numpy(x),                                     # (1440, 14)
-            "target_next": torch.from_numpy(target_next),                 # (14,)
+            "x": torch.from_numpy(x),                                     # (1440, feats)
+            "target_next": torch.from_numpy(target_next),                 # (5,)
+            "actual_next_ohlcv": torch.from_numpy(next_ohlcv),           # (5,)
             "prev_close": torch.tensor(prev_close, dtype=torch.float32),  # scalar
-            "actual_next_close": torch.tensor(actual_next_close, dtype=torch.float32),
+            "p_min": torch.tensor(p_min, dtype=torch.float32),            # scalar
+            "p_range": torch.tensor(p_range, dtype=torch.float32),        # scalar
+            "v_min": torch.tensor(v_min, dtype=torch.float32),            # scalar
+            "v_range": torch.tensor(v_range, dtype=torch.float32),        # scalar
             "pair": self.pair_name
         }
 
@@ -253,12 +286,20 @@ def process_pair_multi_timeframe(
     df_4h_raw = resample_ohlcv(df_raw, "4h")
     df_1d_raw = resample_ohlcv(df_raw, "1d")
 
-    # 2. Compute 14 features for each timeframe
+    # 2. Compute features for each timeframe
     df_1h = compute_timeframe_features(df_raw, timeframe_id=3.0)
     df_4h = compute_timeframe_features(df_4h_raw, timeframe_id=2.0)
     df_1d = compute_timeframe_features(df_1d_raw, timeframe_id=1.0)
 
-    # 3. Add closed_at and row index for causal alignment
+    # 3. Compute rolling window min/max for 1H price and volume normalization
+    df_1h = df_1h.with_columns([
+        pl.col("low").rolling_min(window_size=LEN_1H).alias("win_p_min"),
+        pl.col("high").rolling_max(window_size=LEN_1H).alias("win_p_max"),
+        pl.col("volume").rolling_min(window_size=LEN_1H).alias("win_v_min"),
+        pl.col("volume").rolling_max(window_size=LEN_1H).alias("win_v_max"),
+    ])
+
+    # 4. Add closed_at and row index for causal alignment
     # Match the exact datetime dtype to prevent Polars SchemaError in join_asof
     dt_type = df_1h["datetime"].dtype
     df_1d = df_1d.with_columns([
@@ -270,7 +311,7 @@ def process_pair_multi_timeframe(
         pl.int_range(0, pl.len()).alias("idx_4h")
     ])
 
-    # 4. Causal join_asof: match 1H candle with the latest CLOSED 1D and 4H candle
+    # 5. Causal join_asof: match 1H candle with the latest CLOSED 1D and 4H candle
     df_aligned = df_1h.join_asof(
         df_1d.select(["closed_at", "idx_1d"]),
         left_on="datetime",
@@ -285,7 +326,7 @@ def process_pair_multi_timeframe(
         pl.int_range(0, pl.len()).alias("h1_idx")
     )
 
-    # 5. Filter valid indices with full lookback:
+    # 6. Filter valid indices with full lookback:
     # Need 180 1D candles, 540 4H candles, 720 1H candles, and 1 forward candle for target
     valid_df = df_aligned.filter(
         (pl.col("idx_1d") >= LEN_1D - 1) &
@@ -301,14 +342,22 @@ def process_pair_multi_timeframe(
     feats_1d = df_1d.select(FEATURE_COLS).to_numpy().astype(np.float32)
     feats_4h = df_4h.select(FEATURE_COLS).to_numpy().astype(np.float32)
     feats_1h = df_1h.select(FEATURE_COLS).to_numpy().astype(np.float32)
-    nominal_closes = df_1h.select("nominal_close").to_numpy().astype(np.float32).flatten()
+
+    ohlcv_1h = df_1h.select(["open", "high", "low", "close", "volume"]).to_numpy().astype(np.float32)
+    win_p_min = df_1h.select("win_p_min").to_numpy().astype(np.float32).flatten()
+    win_p_max = df_1h.select("win_p_max").to_numpy().astype(np.float32).flatten()
+    win_p_range = np.maximum(win_p_max - win_p_min, 1e-8).astype(np.float32)
+
+    win_v_min = df_1h.select("win_v_min").to_numpy().astype(np.float32).flatten()
+    win_v_max = df_1h.select("win_v_max").to_numpy().astype(np.float32).flatten()
+    win_v_range = np.maximum(win_v_max - win_v_min, 1e-8).astype(np.float32)
 
     # Apply step_stride (e.g. sample every 4 hours instead of every 1 hour to reduce 99.9% redundant overlap)
     h1_indices = valid_df.select("h1_idx").to_numpy().flatten()[::step_stride]
     idx_1d_map = valid_df.select("idx_1d").to_numpy().flatten()[::step_stride]
     idx_4h_map = valid_df.select("idx_4h").to_numpy().flatten()[::step_stride]
 
-    # 6. Sequential train / val / test split
+    # 7. Sequential train / val / test split
     total = len(h1_indices)
     train_end = int(total * train_ratio)
     val_end = int(total * (train_ratio + val_ratio))
@@ -318,7 +367,11 @@ def process_pair_multi_timeframe(
             features_1d=feats_1d,
             features_4h=feats_4h,
             features_1h=feats_1h,
-            nominal_closes_1h=nominal_closes,
+            ohlcv_1h=ohlcv_1h,
+            win_p_min=win_p_min,
+            win_p_range=win_p_range,
+            win_v_min=win_v_min,
+            win_v_range=win_v_range,
             h1_indices=h1_indices[start:end],
             idx_1d_map=idx_1d_map[start:end],
             idx_4h_map=idx_4h_map[start:end],

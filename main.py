@@ -4,7 +4,17 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from config import Config
-from dataset import FEATURE_COLS, build_multi_pair_datasets
+from dataset import (
+    FEATURE_COLS,
+    TARGET_COLS,
+    TARGET_DIM,
+    TARGET_OPEN_IDX,
+    TARGET_HIGH_IDX,
+    TARGET_LOW_IDX,
+    TARGET_CLOSE_IDX,
+    TARGET_VOLUME_IDX,
+    build_multi_pair_datasets,
+)
 from model.transformer import SelfSupervisedTransformer
 from utils.model_checkpoint import save_model
 from utils.plot_info import (
@@ -13,8 +23,6 @@ from utils.plot_info import (
     plot_training_metrics,
 )
 from utils.torch_device import get_device
-
-CLOSE_PCT_IDX = FEATURE_COLS.index("feat_close_pct")
 
 
 def train_one_epoch(
@@ -32,12 +40,12 @@ def train_one_epoch(
     total_batches = len(dataloader)
 
     for batch_idx, batch in enumerate(dataloader, start=1):
-        x = batch["x"].to(device)                      # (B, L, V)
-        target_next = batch["target_next"].to(device)  # (B, V)
+        x = batch["x"].to(device)                      # (B, L, feats)
+        target_next = batch["target_next"].to(device)  # (B, out_feats=5)
 
         optimizer.zero_grad()
 
-        pred_next = model(x)
+        pred_next = model(x)                           # (B, 5)
         loss = criterion(pred_next, target_next.to(pred_next.dtype))
 
         if scaler is not None and scaler.is_enabled():
@@ -77,20 +85,22 @@ def evaluate(model, dataloader, criterion, device):
             x = batch["x"].to(device)
             target_next = batch["target_next"].to(device)
             prev_close = batch["prev_close"].to(device)
-            actual_next_close = batch["actual_next_close"].to(device)
+            actual_next_close = batch["actual_next_ohlcv"][:, TARGET_CLOSE_IDX].to(device)
+            p_min = batch["p_min"].to(device)
+            p_range = batch["p_range"].to(device)
             pairs = batch["pair"]
 
             pred_next = model(x)
             loss = criterion(pred_next, target_next.to(pred_next.dtype))
             total_loss += loss.item()
 
-            pred_pct = pred_next[:, CLOSE_PCT_IDX]
-            true_pct = target_next[:, CLOSE_PCT_IDX]
+            # Denormalize predicted nominal close price: P_pred = norm * p_range + p_min
+            pred_next_close = pred_next[:, TARGET_CLOSE_IDX] * p_range + p_min
 
-            # Reconstruct nominal price: P(t) = pct * P(t-1) + P(t-1)
-            pred_next_close = pred_pct * prev_close + prev_close
-
-            is_correct = (torch.sign(pred_pct) == torch.sign(true_pct)).cpu().numpy()
+            # Directional accuracy relative to prev_close
+            pred_dir = pred_next_close - prev_close
+            true_dir = actual_next_close - prev_close
+            is_correct = (torch.sign(pred_dir) == torch.sign(true_dir)).cpu().numpy()
             correct_direction += is_correct.sum()
             total_price_error += torch.abs(pred_next_close - actual_next_close).sum().item()
             total_samples += x.size(0)
@@ -152,7 +162,10 @@ def main(cfg: Config | None = None):
     )
 
     # 3. Initialize Transformer & Mixed Precision
-    model = SelfSupervisedTransformer(feats=len(FEATURE_COLS)).to(device)
+    model = SelfSupervisedTransformer(
+        feats=len(FEATURE_COLS),
+        out_feats=TARGET_DIM,
+    ).to(device)
 
     criterion = nn.HuberLoss()
     optimizer = torch.optim.AdamW(
@@ -275,25 +288,39 @@ def main(cfg: Config | None = None):
     sample_batch = next(iter(val_loader))
     sample_x = sample_batch["x"].to(device)
     sample_prev_close = sample_batch["prev_close"].to(device)
-    sample_actual_close = sample_batch["actual_next_close"].to(device)
-    sample_actual_pct = sample_batch["target_next"][:, CLOSE_PCT_IDX].to(device)
+    sample_actual_ohlcv = sample_batch["actual_next_ohlcv"].to(device)
+    sample_actual_close = sample_actual_ohlcv[:, TARGET_CLOSE_IDX]
+    sample_p_min = sample_batch["p_min"].to(device)
+    sample_p_range = sample_batch["p_range"].to(device)
+    sample_v_min = sample_batch["v_min"].to(device)
+    sample_v_range = sample_batch["v_range"].to(device)
     sample_pairs = sample_batch["pair"]
 
     with torch.no_grad():
-        pred_vectors = model(sample_x)
-        predicted_pcts = pred_vectors[:, CLOSE_PCT_IDX]
-        predicted_closes = predicted_pcts * sample_prev_close + sample_prev_close
+        pred_norm = model(sample_x)
+        pred_opens = pred_norm[:, TARGET_OPEN_IDX] * sample_p_range + sample_p_min
+        pred_highs = pred_norm[:, TARGET_HIGH_IDX] * sample_p_range + sample_p_min
+        pred_lows = pred_norm[:, TARGET_LOW_IDX] * sample_p_range + sample_p_min
+        pred_closes = pred_norm[:, TARGET_CLOSE_IDX] * sample_p_range + sample_p_min
+        pred_vols = pred_norm[:, TARGET_VOLUME_IDX] * sample_v_range + sample_v_min
+
+        predicted_pcts = (pred_closes - sample_prev_close) / sample_prev_close
+        actual_pcts = (sample_actual_close - sample_prev_close) / sample_prev_close
 
     print("\n--- Multi-Pair Inference Demonstration ---")
     for i in range(min(4, len(sample_pairs))):
         pair = sample_pairs[i]
         p_prev = sample_prev_close[i].item()
-        p_pred = predicted_closes[i].item()
+        p_pred = pred_closes[i].item()
         p_act = sample_actual_close[i].item()
         pct_pred = predicted_pcts[i].item()
-        pct_act = sample_actual_pct[i].item()
+        pct_act = actual_pcts[i].item()
 
-        print(f"[{pair}] P(t-1)={p_prev:.4f} | Pred pct={pct_pred:+.3%} -> Pred P(t)={p_pred:.4f} | Actual P(t)={p_act:.4f} ({pct_act:+.3%})")
+        print(
+            f"[{pair}] P(t-1)={p_prev:.4f} | Pred close={p_pred:.4f} ({pct_pred:+.3%}) "
+            f"[O:{pred_opens[i].item():.4f} H:{pred_highs[i].item():.4f} L:{pred_lows[i].item():.4f}] | "
+            f"Actual close={p_act:.4f} ({pct_act:+.3%})"
+        )
 
     # 7. Generate & Save Diagnostic Plots
     print(f"\nGenerating and saving plots to '{cfg.plots_dir}'...")
@@ -313,7 +340,7 @@ def main(cfg: Config | None = None):
     sample_size = min(60, len(sample_actual_close))
     plot_price_predictions(
         actual_prices=sample_actual_close[:sample_size].cpu().numpy(),
-        predicted_prices=predicted_closes[:sample_size].cpu().numpy(),
+        predicted_prices=pred_closes[:sample_size].cpu().numpy(),
         pair_name=sample_pairs[0] if sample_pairs else "Sample",
         save_dir=cfg.plots_dir,
     )

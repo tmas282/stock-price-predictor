@@ -1,19 +1,18 @@
 import torch
 from torch import nn
 
+
 class SelfSupervisedTransformer(nn.Module):
     """
-    Input: (B, L, V)
-    L = 6 months * 30 days (Daily Candles)
-    L += 3 months * 30 days * 6 candles (4-Hour Candles)
-    L += 30 days * 24 candles (1-Hour Candles)s
-    V = (day, month, hour_open, hour_end, open, close, high, low, volume, pair, ...)
-    Output: (B, V)
-
+    Input: (B, L, feats)
+    L = 180 Daily + 540 4-Hour + 720 1-Hour = 1440 tokens
+    feats = 26 (cyclical time, relative returns, technical indicators)
+    Output: (B, out_feats=5) -> next candle [open, high, low, close, volume]
     """
     def __init__(
         self,
         feats: int = 26,
+        out_feats: int = 5,
         d_model: int = 64,
         nhead: int = 8,
         num_encoder_layers: int = 4,
@@ -28,7 +27,7 @@ class SelfSupervisedTransformer(nn.Module):
         super().__init__()
         self.projection_input_layer = nn.Linear(feats, d_model)
         self.relu = nn.ReLU()
-        self.projection_output_layer = nn.Linear(d_model, feats)
+        self.projection_output_layer = nn.Linear(d_model, out_feats)
         self.transformer = nn.Transformer(
             d_model=d_model,
             nhead=nhead,
@@ -41,11 +40,12 @@ class SelfSupervisedTransformer(nn.Module):
             batch_first=batch_first,
             norm_first=norm_first
         )
+
     @torch.autocast(device_type="cuda", enabled=torch.cuda.is_available(), 
                     dtype=torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16)
     def forward(self, x):
-        # src: full historical context (B, L, V)
-        # tgt: the last candle in the context window (B, 1, V)
+        # src: full historical context (B, L, feats)
+        # tgt: the last candle in the context window (B, 1, feats)
 
         x_proj = self.projection_input_layer(x)
         x_proj_relu = self.relu(x_proj)
@@ -53,6 +53,6 @@ class SelfSupervisedTransformer(nn.Module):
         src = x_proj_relu
         tgt = x_proj_relu[:, -1:, :]
 
-        out = self.transformer(src=src, tgt=tgt)  # (B, 1, V)
-        out_normal = self.projection_output_layer(out)
-        return torch.clip(out_normal.squeeze(1), -1, 1)   # (B, V)
+        out = self.transformer(src=src, tgt=tgt)  # (B, 1, d_model)
+        out_normal = self.projection_output_layer(out)  # (B, 1, out_feats)
+        return out_normal.squeeze(1)  # (B, out_feats)
