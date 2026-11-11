@@ -1,0 +1,24 @@
+[project]
+name = "stock-price-predictor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv",
+    "matplotlib",
+    "numpy",
+    "polars",
+    "scikit-learn>=1.9.1",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+    "transformers",
+]
+
+[[tool.uv.index]]
+name = "pytorch-with-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+
+[tool.uv.sources]
+torch = { index = "pytorch-with-cu132" }
+torchvision = { index = "pytorch-with-cu132" }
