@@ -16,25 +16,36 @@ from utils.torch_device import get_device
 CLOSE_PCT_IDX = FEATURE_COLS.index("feat_close_pct")
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch: int, log_interval: int = 250):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    epoch: int,
+    scaler=None,
+    log_interval: int = 250,
+):
     model.train()
     total_loss = 0.0
     total_batches = len(dataloader)
 
     for batch_idx, batch in enumerate(dataloader, start=1):
-        x = batch["x"].to(device)                      # (B, L, 14)
-        target_next = batch["target_next"].to(device)  # (B, 14)
+        x = batch["x"].to(device)                      # (B, L, V)
+        target_next = batch["target_next"].to(device)  # (B, V)
 
         optimizer.zero_grad()
-        
-        # Forward pass:
-        # src = x (L = 1440 multi-timeframe context)
-        # tgt = x[:, -1:, :] (last 1H candle)
-        pred_next = model(x)
 
+        pred_next = model(x)
         loss = criterion(pred_next, target_next)
-        loss.backward()
-        optimizer.step()
+
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
 
@@ -135,7 +146,7 @@ def main(cfg: Config | None = None):
         persistent_workers=(cfg.num_workers > 0),
     )
 
-    # 3. Initialize Transformer
+    # 3. Initialize Transformer & Mixed Precision
     model = SelfSupervisedTransformer(feats=len(FEATURE_COLS)).to(device)
 
     criterion = nn.SmoothL1Loss()
@@ -144,6 +155,17 @@ def main(cfg: Config | None = None):
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay
     )
+
+    # Dynamic Mixed Precision & GradScaler Setup:
+    # - RTX 30xx/40xx (Ampere/Ada) GPUs natively support bfloat16: no GradScaler needed
+    # - Older GPUs (Volta/Turing) use float16: GradScaler prevents underflow
+    # - CPU runs standard float32
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        scaler = None
+    elif torch.cuda.is_available():
+        scaler = torch.amp.GradScaler("cuda", enabled=True)
+    else:
+        scaler = None
 
     # Automatically adapt log interval so it logs ~10 to 20 times per epoch
     log_interval = max(50, len(train_loader) // 20)
@@ -167,6 +189,7 @@ def main(cfg: Config | None = None):
             criterion=criterion,
             device=device,
             epoch=epoch,
+            scaler=scaler,
             log_interval=log_interval
         )
         val_loss, val_acc, val_mae, last_pair_correct, last_pair_total = evaluate(model, val_loader, criterion, device)

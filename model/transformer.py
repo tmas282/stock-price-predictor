@@ -1,5 +1,4 @@
 import torch
-
 from torch import nn
 
 class SelfSupervisedTransformer(nn.Module):
@@ -42,6 +41,8 @@ class SelfSupervisedTransformer(nn.Module):
             batch_first=batch_first,
             norm_first=norm_first
         )
+    @torch.autocast(device_type="cuda", enabled=torch.cuda.is_available(), 
+                    dtype=torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16)
     def forward(self, x):
         # src: full historical context (B, L, V)
         # tgt: the last candle in the context window (B, 1, V)
