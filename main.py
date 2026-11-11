@@ -37,7 +37,7 @@ def train_one_epoch(
         optimizer.zero_grad()
 
         pred_next = model(x)
-        loss = criterion(pred_next, target_next)
+        loss = criterion(pred_next, target_next.to(pred_next.dtype))
 
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -80,7 +80,7 @@ def evaluate(model, dataloader, criterion, device):
             pairs = batch["pair"]
 
             pred_next = model(x)
-            loss = criterion(pred_next, target_next)
+            loss = criterion(pred_next, target_next.to(pred_next.dtype))
             total_loss += loss.item()
 
             pred_pct = pred_next[:, CLOSE_PCT_IDX]
@@ -149,7 +149,7 @@ def main(cfg: Config | None = None):
     # 3. Initialize Transformer & Mixed Precision
     model = SelfSupervisedTransformer(feats=len(FEATURE_COLS)).to(device)
 
-    criterion = nn.SmoothL1Loss()
+    criterion = nn.HuberLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
