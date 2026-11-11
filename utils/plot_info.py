@@ -13,16 +13,21 @@ def plot_training_metrics(
     train_losses: list[float],
     val_losses: list[float],
     val_accuracies: list[float],
+    learning_rates: list[float] | None = None,
     save_dir: str = "plots",
     filename: str = "training_metrics.png",
 ):
     """
-    Plots training loss, validation loss, and directional accuracy curves over epochs.
+    Plots training loss, validation loss, directional accuracy, and optionally learning rate over epochs.
     """
     ensure_dir(save_dir)
     epochs = list(range(1, len(train_losses) + 1))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    if learning_rates and len(learning_rates) == len(epochs):
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    else:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        ax3 = None
 
     # 1. Loss Curve
     ax1.plot(epochs, train_losses, "b-o", label="Train Loss")
@@ -41,6 +46,15 @@ def plot_training_metrics(
     ax2.set_ylabel("Accuracy (%)")
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.legend()
+
+    # 3. Learning Rate Progression
+    if ax3 is not None and learning_rates:
+        ax3.plot(epochs, learning_rates, "m-d", label="Learning Rate")
+        ax3.set_title("Learning Rate Schedule")
+        ax3.set_xlabel("Epoch")
+        ax3.set_ylabel("Learning Rate")
+        ax3.grid(True, linestyle="--", alpha=0.6)
+        ax3.legend()
 
     plt.tight_layout()
     output_path = os.path.join(save_dir, filename)

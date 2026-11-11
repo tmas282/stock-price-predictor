@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from config import Config
@@ -111,7 +112,11 @@ def main(cfg: Config | None = None):
 
     device = get_device()
     print(f"Device: {device}")
-    print(f"Hyperparameters: epochs={cfg.epochs}, batch_size={cfg.batch_size}, num_workers={cfg.num_workers}, lr={cfg.learning_rate}, weight_decay={cfg.weight_decay}")
+    print(
+        f"Hyperparameters: epochs={cfg.epochs}, batch_size={cfg.batch_size}, "
+        f"num_workers={cfg.num_workers}, lr={cfg.learning_rate}, "
+        f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}"
+    )
     print(f"Data settings: dir='{cfg.data_dir}', step_stride={cfg.step_stride}h, plots_dir='{cfg.plots_dir}', checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}")
 
     # 1. Build Hierarchical Multi-Timeframe Datasets (L = 1440)
@@ -155,6 +160,11 @@ def main(cfg: Config | None = None):
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay
     )
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=cfg.epochs,
+        eta_min=cfg.lr_min
+    )
 
     # Dynamic Mixed Precision & GradScaler Setup:
     # - RTX 30xx/40xx (Ampere/Ada) GPUs natively support bfloat16: no GradScaler needed
@@ -175,13 +185,17 @@ def main(cfg: Config | None = None):
     history_train_loss = []
     history_val_loss = []
     history_val_acc = []
+    history_lr = []
     best_val_loss = float("inf")
     last_pair_correct: dict[str, int] = {}
     last_pair_total: dict[str, int] = {}
 
     print(f"\nStarting multi-pair self-supervised training for {epochs} epochs (Logging every {log_interval} batches)...")
     for epoch in range(1, epochs + 1):
-        print(f"\n--- Epoch [{epoch:02d}/{epochs:02d}] ---")
+        current_lr = optimizer.param_groups[0]["lr"]
+        history_lr.append(current_lr)
+
+        print(f"\n--- Epoch [{epoch:02d}/{epochs:02d}] (LR: {current_lr:.6g}) ---")
         train_loss = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -198,12 +212,17 @@ def main(cfg: Config | None = None):
         history_val_loss.append(val_loss)
         history_val_acc.append(val_acc)
 
+        # Step CosineAnnealingLR scheduler after each epoch
+        scheduler.step()
+        next_lr = optimizer.param_groups[0]["lr"]
+
         print(
             f"End of Epoch {epoch:02d} | "
             f"Train Loss: {train_loss:.6f} | "
             f"Val Loss: {val_loss:.6f} | "
             f"Val Directional Acc: {val_acc:.2f}% | "
-            f"Val Price MAE: {val_mae:.5f}"
+            f"Val Price MAE: {val_mae:.5f} | "
+            f"LR: {current_lr:.6g} -> {next_lr:.6g}"
         )
 
         # Save checkpoint after every epoch
@@ -213,11 +232,13 @@ def main(cfg: Config | None = None):
             "val_loss": val_loss,
             "val_acc": val_acc,
             "val_mae": val_mae,
+            "lr": current_lr,
         }
         save_model(
             model=model,
             save_path=epoch_path,
             optimizer=optimizer,
+            scheduler=scheduler,
             epoch=epoch,
             metrics=metrics_dict,
         )
@@ -231,6 +252,7 @@ def main(cfg: Config | None = None):
                 model=model,
                 save_path=best_path,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 metrics=metrics_dict,
             )
@@ -279,6 +301,7 @@ def main(cfg: Config | None = None):
         train_losses=history_train_loss,
         val_losses=history_val_loss,
         val_accuracies=history_val_acc,
+        learning_rates=history_lr,
         save_dir=cfg.plots_dir,
     )
     plot_pair_accuracies(
