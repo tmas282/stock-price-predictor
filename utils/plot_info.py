@@ -58,41 +58,6 @@ def plot_training_metrics(
     print(f"Saved training metrics plot -> {output_path}")
 
 
-def plot_price_predictions(
-    actual_prices: list[float] | np.ndarray,
-    predicted_prices: list[float] | np.ndarray,
-    pair_name: str = "EURUSD",
-    save_dir: str = "plots",
-    filename: str | None = None,
-):
-    """
-    Plots actual next nominal prices against model-predicted nominal prices across a sequence.
-    """
-    ensure_dir(save_dir)
-    if filename is None:
-        filename = f"{pair_name}_price_predictions.png"
-
-    actual = np.asarray(actual_prices)
-    pred = np.asarray(predicted_prices)
-    steps = np.arange(len(actual))
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(steps, actual, label="Actual Next Close P(t)", color="black", linewidth=1.5)
-    plt.plot(steps, pred, label="Predicted Next Close P(t)", color="royalblue", linestyle="--", linewidth=1.5)
-
-    plt.title(f"Next-Candle Price Reconstruction: {pair_name}")
-    plt.xlabel("Sample Step (1H Candles)")
-    plt.ylabel("Price")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-
-    plt.tight_layout()
-    output_path = os.path.join(save_dir, filename)
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved price prediction plot -> {output_path}")
-
-
 def plot_pair_accuracies(
     pair_accuracies: dict[str, float],
     save_dir: str = "plots",

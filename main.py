@@ -19,7 +19,6 @@ from model.transformer import SelfSupervisedTransformer
 from utils.model_checkpoint import save_model
 from utils.plot_info import (
     plot_pair_accuracies,
-    plot_price_predictions,
     plot_training_metrics,
 )
 from utils.torch_device import get_device
@@ -336,14 +335,6 @@ def main(cfg: Config | None = None):
         save_dir=cfg.plots_dir,
     )
 
-    # Plot sample consecutive price predictions
-    sample_size = min(60, len(sample_actual_close))
-    plot_price_predictions(
-        actual_prices=sample_actual_close[:sample_size].cpu().numpy(),
-        predicted_prices=pred_closes[:sample_size].cpu().numpy(),
-        pair_name=sample_pairs[0] if sample_pairs else "Sample",
-        save_dir=cfg.plots_dir,
-    )
     print("Done!")
 
 

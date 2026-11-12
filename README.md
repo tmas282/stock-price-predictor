@@ -45,3 +45,10 @@
 
 ## Dataset
 https://huggingface.co/datasets/Yllvar/fx-historical-data
+
+
+## Background training
+
+```bash
+nohup bash -c "uv run main.py" > output.log 2>&1 &
+```

@@ -17,8 +17,6 @@ ALL_PAIRS = [
     "AUDJPY", "CADJPY", "CHFJPY", "NZDJPY",
     # Other Crosses
     "AUDCAD", "AUDCHF", "AUDNZD", "CADCHF", "NZDCAD", "NZDCHF",
-    # Commodities / Precious Metals
-    "XAUUSD", "XAGUSD"
 ]
 
 # Timeframe Lookback Sequence Lengths (Total L = 1440)
@@ -255,6 +253,7 @@ class MultiTimeframeDataset(Dataset):
         target_next[2] = (next_ohlcv[2] - p_min) / p_range  # low
         target_next[3] = (next_ohlcv[3] - p_min) / p_range  # close
         target_next[4] = (next_ohlcv[4] - v_min) / v_range  # volume
+        target_next = np.clip(target_next, -5.0, 5.0)
 
         prev_close = self.ohlcv_1h[h1_idx, 3]
 
@@ -350,7 +349,7 @@ def process_pair_multi_timeframe(
 
     win_v_min = df_1h.select("win_v_min").to_numpy().astype(np.float32).flatten()
     win_v_max = df_1h.select("win_v_max").to_numpy().astype(np.float32).flatten()
-    win_v_range = np.maximum(win_v_max - win_v_min, 1e-8).astype(np.float32)
+    win_v_range = np.maximum(win_v_max - win_v_min, 1.0).astype(np.float32)
 
     # Apply step_stride (e.g. sample every 4 hours instead of every 1 hour to reduce 99.9% redundant overlap)
     h1_indices = valid_df.select("h1_idx").to_numpy().flatten()[::step_stride]
