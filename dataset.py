@@ -5,6 +5,13 @@ import polars as pl
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 from indicators import add_all_indicators
+from news.aggregator import (
+    LEN_NEWS_1H,
+    NEWS_FEATS,
+    aggregate_news_to_1h_currencies,
+    compute_hourly_time_features,
+    compute_sigmoidal_recency,
+)
 
 ALL_PAIRS = [
     # Major Pairs
@@ -61,7 +68,11 @@ FEATURE_COLS = [
     "feat_vwap",
 ]
 
-# Target next candle prediction columns (5):
+# Target next 7 Daily (1D) candles prediction (7 x 5):
+PRED_DAYS = 7
+HOURS_PER_DAY = 24
+PRED_HOURS = PRED_DAYS * HOURS_PER_DAY  # 168 1H candles
+
 TARGET_COLS = ["open", "high", "low", "close", "volume"]
 TARGET_DIM = len(TARGET_COLS)
 
@@ -205,6 +216,10 @@ class MultiTimeframeDataset(Dataset):
         idx_1d_map: np.ndarray,
         idx_4h_map: np.ndarray,
         pair_name: str,
+        news_base_1h: np.ndarray | None = None,
+        news_quote_1h: np.ndarray | None = None,
+        news_time_1h: np.ndarray | None = None,
+        news_recency: np.ndarray | None = None,
     ):
         super().__init__()
         self.features_1d = features_1d
@@ -219,6 +234,10 @@ class MultiTimeframeDataset(Dataset):
         self.idx_1d_map = idx_1d_map
         self.idx_4h_map = idx_4h_map
         self.pair_name = pair_name
+        self.news_base_1h = news_base_1h
+        self.news_quote_1h = news_quote_1h
+        self.news_time_1h = news_time_1h
+        self.news_recency = news_recency
 
     def __len__(self) -> int:
         return len(self.h1_indices)
@@ -240,25 +259,61 @@ class MultiTimeframeDataset(Dataset):
         # 4. Concatenate along time: Total sequence length L = 180 + 540 + 720 = 1440
         x = np.concatenate([c_1d, c_4h, c_1h], axis=0)
 
-        # 5. Target: Next 1-Hour candle normalized OHLCV: [open, high, low, close, volume]
-        next_ohlcv = self.ohlcv_1h[h1_idx + 1]  # [open, high, low, close, volume]
+        # 5. Target: Next 7 Daily (1D = 24h) candles normalized OHLCV: shape (7, 5)
+        future_1h = self.ohlcv_1h[h1_idx + 1 : h1_idx + 1 + PRED_HOURS].reshape(
+            PRED_DAYS, HOURS_PER_DAY, 5
+        )
+        next_ohlcv = np.empty((PRED_DAYS, 5), dtype=np.float32)
+        next_ohlcv[:, 0] = future_1h[:, 0, 0]                # open
+        next_ohlcv[:, 1] = future_1h[:, :, 1].max(axis=1)    # high
+        next_ohlcv[:, 2] = future_1h[:, :, 2].min(axis=1)    # low
+        next_ohlcv[:, 3] = future_1h[:, -1, 3]               # close
+        next_ohlcv[:, 4] = future_1h[:, :, 4].sum(axis=1)    # volume
+
         p_min = self.win_p_min[h1_idx]
         p_range = self.win_p_range[h1_idx]
         v_min = self.win_v_min[h1_idx]
         v_range = self.win_v_range[h1_idx]
 
-        target_next = np.empty(5, dtype=np.float32)
-        target_next[0] = (next_ohlcv[0] - p_min) / p_range  # open
-        target_next[1] = (next_ohlcv[1] - p_min) / p_range  # high
-        target_next[2] = (next_ohlcv[2] - p_min) / p_range  # low
-        target_next[3] = (next_ohlcv[3] - p_min) / p_range  # close
-        target_next[4] = (next_ohlcv[4] - v_min) / v_range  # volume
+        target_next = np.empty((PRED_DAYS, 5), dtype=np.float32)
+        target_next[:, 0:4] = (next_ohlcv[:, 0:4] - p_min) / p_range
+        target_next[:, 4] = ((next_ohlcv[:, 4] / HOURS_PER_DAY) - v_min) / v_range
         target_next = np.clip(target_next, -5.0, 5.0)
 
         prev_close = self.ohlcv_1h[h1_idx, 3]
 
+        # 6. Slice past 120 hours (5 days) of causal news features: shape (120, 12)
+        if (
+            self.news_base_1h is not None
+            and self.news_quote_1h is not None
+            and self.news_time_1h is not None
+            and self.news_recency is not None
+        ):
+            n_start = h1_idx - LEN_NEWS_1H + 1
+            n_end = h1_idx + 1
+            base_s = self.news_base_1h[n_start:n_end]    # (120, 2): [sent, imp]
+            quote_s = self.news_quote_1h[n_start:n_end]  # (120, 2): [sent, imp]
+            rel_sent = base_s[:, 0:1] - quote_s[:, 0:1]
+            recency = self.news_recency[:, None]
+            time_s = self.news_time_1h[n_start:n_end]    # (120, 6)
+            news = np.concatenate(
+                [
+                    base_s[:, 0:1],
+                    quote_s[:, 0:1],
+                    rel_sent,
+                    base_s[:, 1:2],
+                    quote_s[:, 1:2],
+                    recency,
+                    time_s,
+                ],
+                axis=1,
+            ).astype(np.float32)
+        else:
+            news = np.zeros((LEN_NEWS_1H, NEWS_FEATS), dtype=np.float32)
+
         return {
             "x": torch.from_numpy(x),                                     # (1440, feats)
+            "news": torch.from_numpy(news),                               # (120, news_feats)
             "target_next": torch.from_numpy(target_next),                 # (5,)
             "actual_next_ohlcv": torch.from_numpy(next_ohlcv),           # (5,)
             "prev_close": torch.tensor(prev_close, dtype=torch.float32),  # scalar
@@ -276,6 +331,7 @@ def process_pair_multi_timeframe(
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     step_stride: int = 4,
+    news_df: pl.DataFrame | None = None,
 ) -> tuple[MultiTimeframeDataset, MultiTimeframeDataset, MultiTimeframeDataset] | None:
     """
     Resamples 1H data into 4H and 1D, computes features, performs strictly causal
@@ -326,12 +382,12 @@ def process_pair_multi_timeframe(
     )
 
     # 6. Filter valid indices with full lookback:
-    # Need 180 1D candles, 540 4H candles, 720 1H candles, and 1 forward candle for target
+    # Need 180 1D candles, 540 4H candles, 720 1H candles, and 7*24 forward 1H candles for target
     valid_df = df_aligned.filter(
         (pl.col("idx_1d") >= LEN_1D - 1) &
         (pl.col("idx_4h") >= LEN_4H - 1) &
         (pl.col("h1_idx") >= LEN_1H - 1) &
-        (pl.col("h1_idx") < len(df_1h) - 1)
+        (pl.col("h1_idx") < len(df_1h) - PRED_HOURS)
     )
 
     if len(valid_df) < 100:
@@ -356,6 +412,19 @@ def process_pair_multi_timeframe(
     idx_1d_map = valid_df.select("idx_1d").to_numpy().flatten()[::step_stride]
     idx_4h_map = valid_df.select("idx_4h").to_numpy().flatten()[::step_stride]
 
+    # Causal 5-day (120h) news arrays aligned to df_1h["datetime"]
+    news_base_1h = None
+    news_quote_1h = None
+    news_time_1h = None
+    news_recency = None
+    if news_df is not None and not news_df.is_empty():
+        base_ccy, quote_ccy = pair_name[:3], pair_name[3:]
+        ccy_arrays = aggregate_news_to_1h_currencies(news_df, df_1h["datetime"])
+        news_base_1h = ccy_arrays.get(base_ccy)
+        news_quote_1h = ccy_arrays.get(quote_ccy)
+        news_time_1h = compute_hourly_time_features(df_1h["datetime"])
+        news_recency = compute_sigmoidal_recency(LEN_NEWS_1H)
+
     # 7. Sequential train / val / test split
     total = len(h1_indices)
     train_end = int(total * train_ratio)
@@ -375,6 +444,10 @@ def process_pair_multi_timeframe(
             idx_1d_map=idx_1d_map[start:end],
             idx_4h_map=idx_4h_map[start:end],
             pair_name=pair_name,
+            news_base_1h=news_base_1h,
+            news_quote_1h=news_quote_1h,
+            news_time_1h=news_time_1h,
+            news_recency=news_recency,
         )
 
     train_ds = make_sub_dataset(0, train_end)
@@ -389,13 +462,21 @@ def build_multi_pair_datasets(
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     step_stride: int = 4,
-    data_dir: str = "data"
+    data_dir: str = "data",
+    news_path: str | None = "data/news_sentiment.parquet",
 ) -> tuple[ConcatDataset, ConcatDataset, ConcatDataset, list[str]]:
     """
     Builds unified multi-pair datasets with context length L = 1440 across all specified pairs.
     """
     if pairs is None:
         pairs = ALL_PAIRS
+
+    news_df: pl.DataFrame | None = None
+    if news_path and os.path.exists(news_path):
+        news_df = pl.read_parquet(news_path)
+        print(f"Loaded {len(news_df):,} scored news rows from '{news_path}'.")
+    else:
+        print(f"No news cache found at '{news_path}'; using zero-filled news tensors.")
 
     train_sets = []
     val_sets = []
@@ -412,6 +493,7 @@ def build_multi_pair_datasets(
                 train_ratio=train_ratio,
                 val_ratio=val_ratio,
                 step_stride=step_stride,
+                news_df=news_df,
             )
             if res is None:
                 continue

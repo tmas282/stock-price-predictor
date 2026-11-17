@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from config import Config
 from dataset import (
     FEATURE_COLS,
+    NEWS_FEATS,
     TARGET_COLS,
     TARGET_DIM,
     TARGET_OPEN_IDX,
@@ -40,11 +41,12 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(dataloader, start=1):
         x = batch["x"].to(device)                      # (B, L, feats)
+        news = batch["news"].to(device)                # (B, 120, news_feats)
         target_next = batch["target_next"].to(device)  # (B, out_feats=5)
 
         optimizer.zero_grad()
 
-        pred_next = model(x)                           # (B, 5)
+        pred_next = model(x, news)                     # (B, 5)
         loss = criterion(pred_next, target_next.to(pred_next.dtype))
 
         if scaler is not None and scaler.is_enabled():
@@ -82,6 +84,7 @@ def evaluate(model, dataloader, criterion, device):
     with torch.no_grad():
         for batch in dataloader:
             x = batch["x"].to(device)
+            news = batch["news"].to(device)
             target_next = batch["target_next"].to(device)
             prev_close = batch["prev_close"].to(device)
             actual_next_close = batch["actual_next_ohlcv"][:, TARGET_CLOSE_IDX].to(device)
@@ -89,7 +92,7 @@ def evaluate(model, dataloader, criterion, device):
             p_range = batch["p_range"].to(device)
             pairs = batch["pair"]
 
-            pred_next = model(x)
+            pred_next = model(x, news)
             loss = criterion(pred_next, target_next.to(pred_next.dtype))
             total_loss += loss.item()
 
@@ -133,7 +136,8 @@ def main(cfg: Config | None = None):
         train_ratio=cfg.train_ratio,
         val_ratio=cfg.val_ratio,
         step_stride=cfg.step_stride,
-        data_dir=cfg.data_dir
+        data_dir=cfg.data_dir,
+        news_path=cfg.news_path,
     )
 
     print(f"\nLoaded {len(loaded_pairs)} pairs.")
@@ -163,6 +167,7 @@ def main(cfg: Config | None = None):
     # 3. Initialize Transformer & Mixed Precision
     model = SelfSupervisedTransformer(
         feats=len(FEATURE_COLS),
+        news_feats=NEWS_FEATS,
         out_feats=TARGET_DIM,
     ).to(device)
 
@@ -286,6 +291,7 @@ def main(cfg: Config | None = None):
     model.eval()
     sample_batch = next(iter(val_loader))
     sample_x = sample_batch["x"].to(device)
+    sample_news = sample_batch["news"].to(device)
     sample_prev_close = sample_batch["prev_close"].to(device)
     sample_actual_ohlcv = sample_batch["actual_next_ohlcv"].to(device)
     sample_actual_close = sample_actual_ohlcv[:, TARGET_CLOSE_IDX]
@@ -296,7 +302,7 @@ def main(cfg: Config | None = None):
     sample_pairs = sample_batch["pair"]
 
     with torch.no_grad():
-        pred_norm = model(sample_x)
+        pred_norm = model(sample_x, sample_news)
         pred_opens = pred_norm[:, TARGET_OPEN_IDX] * sample_p_range + sample_p_min
         pred_highs = pred_norm[:, TARGET_HIGH_IDX] * sample_p_range + sample_p_min
         pred_lows = pred_norm[:, TARGET_LOW_IDX] * sample_p_range + sample_p_min
