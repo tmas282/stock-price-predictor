@@ -4,7 +4,7 @@ import numpy as np
 import polars as pl
 import torch
 from torch.utils.data import ConcatDataset, Dataset
-from indicators import add_all_indicators
+from candles.indicators import add_all_indicators
 from news.aggregator import (
     LEN_NEWS_1H,
     NEWS_FEATS,
