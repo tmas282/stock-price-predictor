@@ -87,29 +87,30 @@ def evaluate(model, dataloader, criterion, device):
             news = batch["news"].to(device)
             target_next = batch["target_next"].to(device)
             prev_close = batch["prev_close"].to(device)
-            actual_next_close = batch["actual_next_ohlcv"][:, TARGET_CLOSE_IDX].to(device)
+            actual_next_close = batch["actual_next_ohlcv"][:, :, TARGET_CLOSE_IDX].to(device)  # (B, 7)
             p_min = batch["p_min"].to(device)
             p_range = batch["p_range"].to(device)
             pairs = batch["pair"]
 
-            pred_next = model(x, news)
+            pred_next = model(x, news)  # (B, 7, 5)
             loss = criterion(pred_next, target_next.to(pred_next.dtype))
             total_loss += loss.item()
 
-            # Denormalize predicted nominal close price: P_pred = norm * p_range + p_min
-            pred_next_close = pred_next[:, TARGET_CLOSE_IDX] * p_range + p_min
+            # Denormalize predicted nominal close prices across all 7 forecast days: (B, 7)
+            pred_next_close = pred_next[:, :, TARGET_CLOSE_IDX] * p_range.unsqueeze(1) + p_min.unsqueeze(1)
 
-            # Directional accuracy relative to prev_close
-            pred_dir = pred_next_close - prev_close
-            true_dir = actual_next_close - prev_close
-            is_correct = (torch.sign(pred_dir) == torch.sign(true_dir)).cpu().numpy()
-            correct_direction += is_correct.sum()
+            # Directional accuracy relative to prev_close across all 7 forecast days
+            pred_dir = pred_next_close - prev_close.unsqueeze(1)
+            true_dir = actual_next_close - prev_close.unsqueeze(1)
+            is_correct = (torch.sign(pred_dir) == torch.sign(true_dir)).cpu().numpy()  # (B, 7)
+            correct_direction += int(is_correct.sum())
             total_price_error += torch.abs(pred_next_close - actual_next_close).sum().item()
-            total_samples += x.size(0)
+            total_samples += int(is_correct.size)
 
+            n_days = is_correct.shape[1]
             for i, p in enumerate(pairs):
-                pair_correct[p] = pair_correct.get(p, 0) + int(is_correct[i])
-                pair_total[p] = pair_total.get(p, 0) + 1
+                pair_correct[p] = pair_correct.get(p, 0) + int(is_correct[i].sum())
+                pair_total[p] = pair_total.get(p, 0) + n_days
 
     avg_loss = total_loss / len(dataloader)
     dir_acc = (correct_direction / total_samples) * 100 if total_samples > 0 else 0.0
@@ -129,7 +130,7 @@ def main(cfg: Config | None = None):
         f"num_workers={cfg.num_workers}, lr={cfg.learning_rate}, "
         f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}"
     )
-    print(f"Data settings: dir='{cfg.data_dir}', step_stride={cfg.step_stride}h, plots_dir='{cfg.plots_dir}', checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}")
+    print(f"Data settings: dir='{cfg.data_dir}', min_date='{cfg.min_date}', step_stride={cfg.step_stride}h, plots_dir='{cfg.plots_dir}', checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}")
 
     # 1. Build Hierarchical Multi-Timeframe Datasets (L = 1440)
     train_dataset, val_dataset, test_dataset, loaded_pairs = build_multi_pair_datasets(
@@ -138,6 +139,7 @@ def main(cfg: Config | None = None):
         step_stride=cfg.step_stride,
         data_dir=cfg.data_dir,
         news_path=cfg.news_path,
+        min_date=cfg.min_date,
     )
 
     print(f"\nLoaded {len(loaded_pairs)} pairs.")
@@ -287,44 +289,39 @@ def main(cfg: Config | None = None):
     for pair in loaded_pairs[:8]:
         print(f"  {pair:<8}: {pair_accuracies[pair]:5.1f}% accuracy ({last_pair_total.get(pair, 0)} windows)")
 
-    # 6. Single-Candle Multi-Pair Inference Demonstration
+    # 6. 7-Day Multi-Pair Inference Demonstration
     model.eval()
     sample_batch = next(iter(val_loader))
     sample_x = sample_batch["x"].to(device)
     sample_news = sample_batch["news"].to(device)
     sample_prev_close = sample_batch["prev_close"].to(device)
-    sample_actual_ohlcv = sample_batch["actual_next_ohlcv"].to(device)
-    sample_actual_close = sample_actual_ohlcv[:, TARGET_CLOSE_IDX]
-    sample_p_min = sample_batch["p_min"].to(device)
-    sample_p_range = sample_batch["p_range"].to(device)
-    sample_v_min = sample_batch["v_min"].to(device)
-    sample_v_range = sample_batch["v_range"].to(device)
+    sample_actual_ohlcv = sample_batch["actual_next_ohlcv"].to(device)  # (B, 7, 5)
+    sample_actual_close = sample_actual_ohlcv[:, :, TARGET_CLOSE_IDX]   # (B, 7)
+    sample_p_min = sample_batch["p_min"].to(device).unsqueeze(1)
+    sample_p_range = sample_batch["p_range"].to(device).unsqueeze(1)
     sample_pairs = sample_batch["pair"]
 
     with torch.no_grad():
-        pred_norm = model(sample_x, sample_news)
-        pred_opens = pred_norm[:, TARGET_OPEN_IDX] * sample_p_range + sample_p_min
-        pred_highs = pred_norm[:, TARGET_HIGH_IDX] * sample_p_range + sample_p_min
-        pred_lows = pred_norm[:, TARGET_LOW_IDX] * sample_p_range + sample_p_min
-        pred_closes = pred_norm[:, TARGET_CLOSE_IDX] * sample_p_range + sample_p_min
-        pred_vols = pred_norm[:, TARGET_VOLUME_IDX] * sample_v_range + sample_v_min
+        pred_norm = model(sample_x, sample_news)  # (B, 7, 5)
+        pred_opens = pred_norm[:, :, TARGET_OPEN_IDX] * sample_p_range + sample_p_min
+        pred_highs = pred_norm[:, :, TARGET_HIGH_IDX] * sample_p_range + sample_p_min
+        pred_lows = pred_norm[:, :, TARGET_LOW_IDX] * sample_p_range + sample_p_min
+        pred_closes = pred_norm[:, :, TARGET_CLOSE_IDX] * sample_p_range + sample_p_min
 
-        predicted_pcts = (pred_closes - sample_prev_close) / sample_prev_close
-        actual_pcts = (sample_actual_close - sample_prev_close) / sample_prev_close
+        predicted_pcts = (pred_closes - sample_prev_close.unsqueeze(1)) / sample_prev_close.unsqueeze(1)
+        actual_pcts = (sample_actual_close - sample_prev_close.unsqueeze(1)) / sample_prev_close.unsqueeze(1)
 
-    print("\n--- Multi-Pair Inference Demonstration ---")
+    print("\n--- Multi-Pair Inference Demonstration (Day 1 -> Day 7) ---")
     for i in range(min(4, len(sample_pairs))):
         pair = sample_pairs[i]
         p_prev = sample_prev_close[i].item()
-        p_pred = pred_closes[i].item()
-        p_act = sample_actual_close[i].item()
-        pct_pred = predicted_pcts[i].item()
-        pct_act = actual_pcts[i].item()
-
         print(
-            f"[{pair}] P(t-1)={p_prev:.4f} | Pred close={p_pred:.4f} ({pct_pred:+.3%}) "
-            f"[O:{pred_opens[i].item():.4f} H:{pred_highs[i].item():.4f} L:{pred_lows[i].item():.4f}] | "
-            f"Actual close={p_act:.4f} ({pct_act:+.3%})"
+            f"[{pair}] P(t-1)={p_prev:.4f} | "
+            f"Day1 Pred={pred_closes[i, 0].item():.4f} ({predicted_pcts[i, 0].item():+.3%}) "
+            f"[O:{pred_opens[i, 0].item():.4f} H:{pred_highs[i, 0].item():.4f} L:{pred_lows[i, 0].item():.4f}] "
+            f"Actual={sample_actual_close[i, 0].item():.4f} ({actual_pcts[i, 0].item():+.3%}) | "
+            f"Day7 Pred={pred_closes[i, -1].item():.4f} ({predicted_pcts[i, -1].item():+.3%}) "
+            f"Actual={sample_actual_close[i, -1].item():.4f} ({actual_pcts[i, -1].item():+.3%})"
         )
 
     # 7. Generate & Save Diagnostic Plots

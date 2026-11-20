@@ -17,6 +17,7 @@ class Config:
 
     data_dir: str = os.getenv("DATA_DIR", "data")
     news_path: str = os.getenv("NEWS_PATH", "data/news_sentiment.parquet")
+    min_date: str | None = os.getenv("MIN_DATE", "2019-09-22") or None
     plots_dir: str = os.getenv("PLOTS_DIR", "plots")
     checkpoint_dir: str = os.getenv("CHECKPOINT_DIR", "checkpoints")
     train_ratio: float = float(os.getenv("TRAIN_RATIO", 0.80))

@@ -1,5 +1,6 @@
 import os
 import urllib.request
+from datetime import datetime, timezone
 import numpy as np
 import polars as pl
 import torch
@@ -332,6 +333,7 @@ def process_pair_multi_timeframe(
     val_ratio: float = 0.15,
     step_stride: int = 4,
     news_df: pl.DataFrame | None = None,
+    min_date: str | None = None,
 ) -> tuple[MultiTimeframeDataset, MultiTimeframeDataset, MultiTimeframeDataset] | None:
     """
     Resamples 1H data into 4H and 1D, computes features, performs strictly causal
@@ -389,6 +391,17 @@ def process_pair_multi_timeframe(
         (pl.col("h1_idx") >= LEN_1H - 1) &
         (pl.col("h1_idx") < len(df_1h) - PRED_HOURS)
     )
+
+    # Optional start-date filter applied AFTER lookback alignment so the earliest
+    # window still retains its full 180D / 540x4H / 720x1H price history.
+    if min_date:
+        min_dt = datetime.fromisoformat(min_date)
+        dt_tz = getattr(dt_type, "time_zone", None)
+        if dt_tz is not None and min_dt.tzinfo is None:
+            min_dt = min_dt.replace(tzinfo=timezone.utc)
+        elif dt_tz is None and min_dt.tzinfo is not None:
+            min_dt = min_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        valid_df = valid_df.filter(pl.col("datetime") >= pl.lit(min_dt).cast(dt_type))
 
     if len(valid_df) < 100:
         return None
@@ -464,6 +477,7 @@ def build_multi_pair_datasets(
     step_stride: int = 4,
     data_dir: str = "data",
     news_path: str | None = "data/news_sentiment.parquet",
+    min_date: str | None = None,
 ) -> tuple[ConcatDataset, ConcatDataset, ConcatDataset, list[str]]:
     """
     Builds unified multi-pair datasets with context length L = 1440 across all specified pairs.
@@ -494,6 +508,7 @@ def build_multi_pair_datasets(
                 val_ratio=val_ratio,
                 step_stride=step_stride,
                 news_df=news_df,
+                min_date=min_date,
             )
             if res is None:
                 continue

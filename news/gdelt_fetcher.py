@@ -26,7 +26,11 @@ DEFAULT_FX_QUERIES: list[str] = [
     '(EURUSD OR GBPUSD OR USDJPY OR forex OR "interest rate" OR "central bank" OR "monetary policy") sourcelang:eng',
 ]
 
-# BigQuery SQL template for GDELT 2.0 GKG (Feb 2015 -> present).
+# Earliest date GDELT 2.0 GKG populated <PAGE_TITLE> inside Extras XML.
+# Partitions before this date contain 0 <PAGE_TITLE> rows.
+GKG_PAGE_TITLE_START_DATE = "2019-09-22"
+
+# BigQuery SQL template for GDELT 2.0 GKG (2019-09-22 -> present).
 # Extracts <PAGE_TITLE> from Extras, filters to native English macro/central-bank
 # articles, and omits heavy V2Organizations/V2Locations columns to minimize bytes scanned.
 HISTORICAL_GKG_SQL = """
@@ -321,8 +325,19 @@ def load_gkg_export(path: str | Path) -> pl.DataFrame:
     return _normalize_news_df(df)
 
 
+def clamp_gkg_start_date(start_date: str) -> str:
+    """Clamps start_date to GKG_PAGE_TITLE_START_DATE (2019-09-22) with a warning."""
+    if start_date < GKG_PAGE_TITLE_START_DATE:
+        print(
+            f"[BigQuery] Warning: GDELT GKG <PAGE_TITLE> only exists from {GKG_PAGE_TITLE_START_DATE} onward. "
+            f"Clamping start_date {start_date} -> {GKG_PAGE_TITLE_START_DATE} to avoid scanning 0-row partitions."
+        )
+        return GKG_PAGE_TITLE_START_DATE
+    return start_date
+
+
 def estimate_historical_bigquery_cost(
-    start_date: str = "2015-02-18",
+    start_date: str = GKG_PAGE_TITLE_START_DATE,
     end_date: str | None = None,
     project_id: str | None = None,
 ) -> dict[str, float | int]:
@@ -337,6 +352,7 @@ def estimate_historical_bigquery_cost(
             "google-cloud-bigquery is not installed. Run: uv add google-cloud-bigquery pyarrow"
         ) from exc
 
+    start_date = clamp_gkg_start_date(start_date)
     if end_date is None:
         end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -357,14 +373,14 @@ def estimate_historical_bigquery_cost(
 
 
 def fetch_historical_bigquery(
-    start_date: str = "2015-02-18",
+    start_date: str = GKG_PAGE_TITLE_START_DATE,
     end_date: str | None = None,
     project_id: str | None = None,
     output_path: str | Path | None = None,
     max_gb_billed: float | None = None,
 ) -> pl.DataFrame:
     """
-    Queries GDELT 2.0 GKG directly via google-cloud-bigquery (2015 -> present)
+    Queries GDELT 2.0 GKG directly via google-cloud-bigquery (2019-09-22 -> present)
     and normalizes the result to NEWS_SCHEMA.
     Requires `google-cloud-bigquery`, `pyarrow`, and GCP credentials configured.
     """
@@ -375,6 +391,7 @@ def fetch_historical_bigquery(
             "google-cloud-bigquery is not installed. Run: uv add google-cloud-bigquery pyarrow"
         ) from exc
 
+    start_date = clamp_gkg_start_date(start_date)
     if end_date is None:
         end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 

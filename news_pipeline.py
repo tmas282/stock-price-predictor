@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from news.currency_mapper import map_news_to_currencies
 from news.finbert import FinBERTScorer
 from news.gdelt_fetcher import (
+    GKG_PAGE_TITLE_START_DATE,
+    clamp_gkg_start_date,
     estimate_historical_bigquery_cost,
     fetch_gdelt_last_n_days,
     fetch_historical_bigquery,
@@ -71,7 +73,7 @@ def run_news_pipeline(
     chunk_hours: int = 24,
     input_gkg_path: str | Path | None = None,
     historical: bool = False,
-    start_date: str = "2015-02-18",
+    start_date: str = GKG_PAGE_TITLE_START_DATE,
     end_date: str | None = None,
     chunk_months: int = 12,
     since_last: bool = False,
@@ -88,7 +90,7 @@ def run_news_pipeline(
     End-to-end news pipeline:
       1. Fetch news:
          - `input_gkg_path`: load a local BigQuery GKG CSV/Parquet export
-         - `historical=True`: query GDELT 2.0 GKG (2015 -> present) via BigQuery
+         - `historical=True`: query GDELT 2.0 GKG (2019-09-22 -> present) via BigQuery
            in resumable `chunk_months` chunks (or `--dry-run` to inspect cost at $0)
          - otherwise: fetch last `days` days from GDELT DOC 2.0 API (chunked by `chunk_hours`)
       2. Map headlines to FX currencies & importance weights.
@@ -102,11 +104,11 @@ def run_news_pipeline(
 
     if historical:
         eff_end = end_date or (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
-        eff_start = start_date
+        eff_start = clamp_gkg_start_date(start_date)
         if since_last and out_path.exists():
             max_ts = pl.read_parquet(out_path, columns=["published_utc"])["published_utc"].max()
             if isinstance(max_ts, (date, datetime)):
-                eff_start = max_ts.strftime("%Y-%m-%d")
+                eff_start = clamp_gkg_start_date(max_ts.strftime("%Y-%m-%d"))
                 merge = True
                 print(f"[since-last] Resuming BigQuery fetch from {eff_start} -> {eff_end}")
 
@@ -131,9 +133,31 @@ def run_news_pipeline(
         scorer: FinBERTScorer | None = None
         df_total = pl.DataFrame()
         raw_dir = Path(save_raw_gkg) if save_raw_gkg is not None else None
+        remaining_gb: float | None = (
+            float(max_gb_billed) if (max_gb_billed is not None and max_gb_billed > 0) else None
+        )
+        total_scanned_gib = 0.0
 
         for idx, (c_start, c_end) in enumerate(chunks, start=1):
-            print(f"\n[Chunk {idx}/{len(chunks)}] Fetching BigQuery GKG {c_start} -> {c_end}...")
+            chunk_est = estimate_historical_bigquery_cost(
+                start_date=c_start,
+                end_date=c_end,
+                project_id=gcp_project,
+            )
+            chunk_gib = float(chunk_est["gib"])
+            if remaining_gb is not None and chunk_gib > remaining_gb:
+                print(
+                    f"\n[Budget Stop] Chunk {idx}/{len(chunks)} ({c_start} -> {c_end}) requires "
+                    f"{chunk_gib:.2f} GiB, exceeding remaining budget ({remaining_gb:.2f} GiB of "
+                    f"{max_gb_billed:.2f} GiB total; {total_scanned_gib:.2f} GiB used so far). "
+                    f"Re-run with --since-last when ready to continue."
+                )
+                break
+
+            print(
+                f"\n[Chunk {idx}/{len(chunks)}] Fetching BigQuery GKG {c_start} -> {c_end} "
+                f"(est. {chunk_gib:.2f} GiB)..."
+            )
             raw_out = (
                 raw_dir / f"gkg_{c_start}_{c_end}.parquet"
                 if (raw_dir is not None and len(chunks) > 1)
@@ -144,8 +168,11 @@ def run_news_pipeline(
                 end_date=c_end,
                 project_id=gcp_project,
                 output_path=raw_out,
-                max_gb_billed=max_gb_billed,
+                max_gb_billed=remaining_gb,
             )
+            total_scanned_gib += chunk_gib
+            if remaining_gb is not None:
+                remaining_gb = max(0.0, remaining_gb - chunk_gib)
             print(f"  Fetched {len(df_raw):,} unique English macro articles.")
             df_mapped = map_news_to_currencies(df_raw, min_importance=min_importance)
             print(f"  Mapped to {len(df_mapped):,} (article, currency) rows.")
@@ -192,12 +219,12 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-hours", type=int, default=24, help="Window size (hours) per DOC API chunk")
     parser.add_argument("--input", type=str, default=None, help="Local historical GKG CSV/Parquet path")
     parser.add_argument("--historical", action="store_true", help="Query historical GDELT 2.0 GKG via BigQuery")
-    parser.add_argument("--start-date", type=str, default="2015-02-18", help="Start date (YYYY-MM-DD) for --historical")
+    parser.add_argument("--start-date", type=str, default=GKG_PAGE_TITLE_START_DATE, help=f"Start date (YYYY-MM-DD) for --historical (min {GKG_PAGE_TITLE_START_DATE})")
     parser.add_argument("--end-date", type=str, default=None, help="End date (YYYY-MM-DD) for --historical (default: tomorrow UTC)")
     parser.add_argument("--chunk-months", type=int, default=12, help="Months per BigQuery chunk for resumable backfill (0 = single query)")
     parser.add_argument("--since-last", action="store_true", help="Resume --historical from max published_utc in --output and merge")
     parser.add_argument("--dry-run", action="store_true", help="Estimate BigQuery scan size & cost ($0) without running")
-    parser.add_argument("--max-gb-billed", type=float, default=None, help="Hard safety cap on GiB billed per BigQuery chunk")
+    parser.add_argument("--max-gb-billed", type=float, default=None, help="Hard cumulative safety cap on total GiB billed across all BigQuery chunks")
     parser.add_argument("--gcp-project", type=str, default=None, help="GCP project ID for BigQuery (or GCP_PROJECT_ID in .env)")
     parser.add_argument("--save-raw-gkg", type=str, default=None, help="Optional Parquet path or directory to cache raw BigQuery export")
     parser.add_argument("--output", type=str, default="data/news_sentiment.parquet", help="Output Parquet cache path")
