@@ -133,6 +133,21 @@ MEDIUM_IMPACT_PATTERN = re.compile(
 HIGH_IMPACT_THEMES = ("ECON_CENTRALBANK", "ECON_INTEREST_RATES", "ECON_INFLATION")
 MEDIUM_IMPACT_THEMES = ("ECON_CURRENCY", "ECON_GDP", "ECON_UNEMPLOYMENT")
 
+# Filters out auto-generated crypto/stablecoin price-bot articles that falsely
+# match currency words like "USD" or "Euro" (e.g., "Binance USD", "Euro Coin").
+CRYPTO_SPAM_PATTERN = re.compile(
+    r"\b("
+    r"24[- ]hour\s+(?:trading\s+)?volume|"
+    r"binance\s+usd|paypal\s+usd|dforce\s+usd|true\s*usd|first\s+digital\s+usd|"
+    r"gemini\s+dollar|pax\s+dollar|euro\s+coin|stasis\s+euro|"
+    r"stablecoin|tether|"
+    r"usdt|usdc|busd|pyusd|tusd|fdusd|usdd|eurc|eurs|"
+    r"price\s+(?:tops|reaches|hits)\s+\$|"
+    r"trading\s+(?:up|down)\s+\d+(?:\.\d+)?%\s+(?:over|this)\s+(?:last\s+)?(?:7\s+days|week)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def detect_currencies_and_importance(
     title: str,
@@ -145,6 +160,9 @@ def detect_currencies_and_importance(
     Identifies which of the 8 major FX currencies an article affects and
     returns (currencies, importance_score in [0.0, 1.0]).
     """
+    if CRYPTO_SPAM_PATTERN.search(title):
+        return [], 0.0
+
     text_blob = f"{title} {organizations}".strip()
     matched: set[str] = set()
 
