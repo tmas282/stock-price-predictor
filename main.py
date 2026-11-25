@@ -154,7 +154,8 @@ def main(cfg: Config | None = None):
         f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}, warmup_ratio={cfg.warmup_ratio}"
     )
     print(
-        f"Data settings: dir='{cfg.data_dir}', use_news={cfg.use_news}, news_path='{cfg.news_path}', "
+        f"Data settings: dir='{cfg.data_dir}', use_microstructure={cfg.use_microstructure}, "
+        f"use_news={cfg.use_news}, news_path='{cfg.news_path}', "
         f"min_date='{cfg.min_date}', step_stride={cfg.step_stride}d, plots_dir='{cfg.plots_dir}', "
         f"checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}"
     )
@@ -168,6 +169,7 @@ def main(cfg: Config | None = None):
         data_dir=cfg.data_dir,
         min_date=cfg.min_date,
         news_path=news_path,
+        include_microstructure=cfg.use_microstructure,
     )
 
     print(f"\nLoaded {len(loaded_pairs)} pairs | Input features: {len(feature_cols)}")
@@ -263,6 +265,7 @@ def main(cfg: Config | None = None):
 
     extra_config = {
         "model_kwargs": model_kwargs,
+        "use_microstructure": cfg.use_microstructure,
         "use_news": cfg.use_news,
         "feature_cols": feature_cols,
     }

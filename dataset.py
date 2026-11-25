@@ -18,6 +18,11 @@ from candles.daily import (
     build_pair_candle_frame,
     load_daily_candle_maps,
 )
+from candles.microstructure import (
+    MICROSTRUCTURE_ABSMAX_COLS,
+    MICROSTRUCTURE_FEATURE_COLS,
+    MICROSTRUCTURE_MINMAX_COLS,
+)
 from news.aggregator import NEWS_FEATURE_COLS, NEWS_MINMAX_COLS, attach_pair_news, load_daily_news_map
 
 # Daily (1D) lookback & forecast horizons
@@ -26,11 +31,17 @@ PRED_DAYS = 7   # Next 7 Daily candles
 TARGET_DIM = 1  # Binary cumulative direction logit per forecast day: 1 if close[t+k] > close[t] else 0
 
 
-def get_feature_cols(include_news: bool = False) -> list[str]:
-    """Returns ordered model input feature columns with optional daily news."""
+def get_feature_cols(
+    include_news: bool = False,
+    include_microstructure: bool = True,
+) -> list[str]:
+    """Returns ordered model input feature columns with optional microstructure and daily news."""
+    cols = list(CANDLE_FEATURE_COLS)
+    if include_microstructure:
+        cols.extend(MICROSTRUCTURE_FEATURE_COLS)
     if include_news:
-        return [*CANDLE_FEATURE_COLS, *NEWS_FEATURE_COLS]
-    return list(CANDLE_FEATURE_COLS)
+        cols.extend(NEWS_FEATURE_COLS)
+    return cols
 
 
 def _filter_min_date(df: pl.DataFrame, min_date: str) -> pl.DataFrame:
@@ -47,7 +58,7 @@ def _filter_min_date(df: pl.DataFrame, min_date: str) -> pl.DataFrame:
 class DailyDataset(Dataset):
     """
     Cross-Pair Daily (1D) sliding-window Dataset for iTransformer:
-      - Input x: (LEN_1D=180, feats=35 or 43 with news)
+      - Input x: (LEN_1D=180, feats=28 base + optional 10 microstructure + optional 8 news)
       - Target:  (PRED_DAYS=7, 1) binary cumulative direction (close[t+k] > close[t])
     """
 
@@ -68,8 +79,10 @@ class DailyDataset(Dataset):
         self.ohlc_idxs = [feature_cols.index(c) for c in OHLC_COLS]
         self.vol_idx = feature_cols.index("volume")
         self.price_ind_idxs = [feature_cols.index(c) for c in PRICE_LEVEL_IND_COLS]
-        minmax_names = set(MINMAX_CANDLE_COLS) | set(NEWS_MINMAX_COLS)
+        minmax_names = set(MINMAX_CANDLE_COLS) | set(MICROSTRUCTURE_MINMAX_COLS) | set(NEWS_MINMAX_COLS)
         self.minmax_idxs = [i for i, c in enumerate(feature_cols) if c in minmax_names]
+        absmax_names = set(MICROSTRUCTURE_ABSMAX_COLS)
+        self.absmax_idxs = [i for i, c in enumerate(feature_cols) if c in absmax_names]
 
     def __len__(self) -> int:
         return len(self.d1_indices)
@@ -98,6 +111,11 @@ class DailyDataset(Dataset):
         col_range = np.maximum(col_vals.max(axis=0) - col_min, 1e-8)
         x[:, self.minmax_idxs] = (col_vals - col_min) / col_range
 
+        if self.absmax_idxs:
+            abs_vals = x[:, self.absmax_idxs]
+            abs_max = np.maximum(np.abs(abs_vals).max(axis=0), 1e-8)
+            x[:, self.absmax_idxs] = abs_vals / abs_max
+
         # 3. Target: Cumulative binary direction for next 7 Daily candles
         next_ohlcv = self.ohlcv_1d[d1_idx + 1 : d1_idx + 1 + PRED_DAYS].copy()
         prev_close = float(self.ohlcv_1d[d1_idx, TARGET_CLOSE_IDX])
@@ -117,6 +135,7 @@ def process_pair_daily(
     daily_ohlcv_map: dict[str, pl.DataFrame],
     daily_closes_map: dict[str, pl.DataFrame],
     daily_news_map: dict[str, pl.DataFrame] | None = None,
+    include_microstructure: bool = True,
     train_ratio: float = 0.80,
     val_ratio: float = 0.10,
     step_stride: int = 1,
@@ -131,7 +150,10 @@ def process_pair_daily(
     if include_news:
         df_1d = attach_pair_news(df_1d, pair_name, daily_news_map)
 
-    feature_cols = get_feature_cols(include_news=include_news)
+    feature_cols = get_feature_cols(
+        include_news=include_news,
+        include_microstructure=include_microstructure,
+    )
     df_1d = df_1d.with_columns(pl.int_range(0, pl.len()).alias("d1_idx"))
 
     valid_df = df_1d.filter(
@@ -167,19 +189,32 @@ def build_multi_pair_datasets(
     data_dir: str = "data",
     min_date: str | None = None,
     news_path: str | None = None,
+    include_microstructure: bool = True,
 ) -> tuple[ConcatDataset, ConcatDataset, ConcatDataset, list[str], list[str]]:
     """
     Builds unified multi-pair Cross-Pair Daily (1D) datasets across `pairs`.
-    Includes optional daily currency news features when `news_path` is provided.
+    Includes optional H1 microstructure and daily currency news features.
     """
     if pairs is None:
         pairs = ALL_PAIRS
 
-    daily_ohlcv_map, daily_closes_map = load_daily_candle_maps(pairs, data_dir=data_dir)
+    daily_ohlcv_map, daily_closes_map = load_daily_candle_maps(
+        pairs,
+        data_dir=data_dir,
+        include_microstructure=include_microstructure,
+    )
     daily_news_map = load_daily_news_map(news_path) if news_path is not None else None
-    feature_cols = get_feature_cols(include_news=daily_news_map is not None)
+    feature_cols = get_feature_cols(
+        include_news=daily_news_map is not None,
+        include_microstructure=include_microstructure,
+    )
 
-    mode_desc = f"candles + news ({news_path})" if daily_news_map is not None else "candles only"
+    mode_parts = ["candles"]
+    if include_microstructure:
+        mode_parts.append("microstructure")
+    if daily_news_map is not None:
+        mode_parts.append(f"news ({news_path})")
+    mode_desc = " + ".join(mode_parts)
     print(
         f"Building Cross-Pair Daily (1D) Datasets "
         f"(T={LEN_1D}d -> S={PRED_DAYS}d | {len(feature_cols)} feats [{mode_desc}] | Stride={step_stride}d) "
@@ -196,6 +231,7 @@ def build_multi_pair_datasets(
                 daily_ohlcv_map=daily_ohlcv_map,
                 daily_closes_map=daily_closes_map,
                 daily_news_map=daily_news_map,
+                include_microstructure=include_microstructure,
                 train_ratio=train_ratio,
                 val_ratio=val_ratio,
                 step_stride=step_stride,

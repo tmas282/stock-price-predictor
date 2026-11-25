@@ -6,18 +6,6 @@ def add_sma(df: pl.DataFrame, windows=[50, 200]) -> pl.DataFrame:
     return df.with_columns([close.rolling_mean(window_size=w).alias(f"SMA_{w}") for w in windows])
 
 
-def add_ema(df: pl.DataFrame, spans=[10, 20]) -> pl.DataFrame:
-    close = pl.col("close")
-    return df.with_columns([close.ewm_mean(span=s).alias(f"EMA_{s}") for s in spans])
-
-
-def add_vma(df: pl.DataFrame, window=20) -> pl.DataFrame:
-    close = pl.col("close")
-    vol = pl.col("volume")
-    vol_sum = vol.rolling_sum(window_size=window).clip(lower_bound=1e-8)
-    return df.with_columns([((close * vol).rolling_sum(window_size=window) / vol_sum).alias(f"VMA_{window}")])
-
-
 def add_atr(df: pl.DataFrame, window=14) -> pl.DataFrame:
     tr = pl.max_horizontal([
         pl.col("high") - pl.col("low"),
@@ -36,28 +24,12 @@ def add_rsi(df: pl.DataFrame, window=14) -> pl.DataFrame:
     return df.with_columns(rsi.alias(f"RSI_{window}"))
 
 
-def add_macd(df: pl.DataFrame, fast=12, slow=26, signal=9) -> pl.DataFrame:
-    macd = pl.col("close").ewm_mean(span=fast) - pl.col("close").ewm_mean(span=slow)
-    return df.with_columns([
-        macd.alias("MACD"),
-        macd.ewm_mean(span=signal).alias("MACD_Signal")
-    ])
-
-
-def add_bollinger_bands(df: pl.DataFrame, window=20, num_std=2) -> pl.DataFrame:
-    middle = pl.col("close").rolling_mean(window_size=window)
-    std = pl.col("close").rolling_std(window_size=window).clip(lower_bound=1e-8)
-    return df.with_columns([
-        middle.alias("BB_Middle"),
-        (middle + num_std * std).alias("BB_Upper"),
-        (middle - num_std * std).alias("BB_Lower")
-    ])
-
-
-def add_vwap(df: pl.DataFrame) -> pl.DataFrame:
+def add_vwap(df: pl.DataFrame, window: int = 20) -> pl.DataFrame:
+    if "VWAP" in df.columns:
+        return df
     tp = (pl.col("high") + pl.col("low") + pl.col("close")) / 3.0
-    vol_cum = pl.col("volume").cum_sum().clip(lower_bound=1e-8)
-    return df.with_columns([((tp * pl.col("volume")).cum_sum() / vol_cum).alias("VWAP")])
+    vol_sum = pl.col("volume").rolling_sum(window_size=window).clip(lower_bound=1e-8)
+    return df.with_columns([((tp * pl.col("volume")).rolling_sum(window_size=window) / vol_sum).alias("VWAP")])
 
 
 def add_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
@@ -68,25 +40,12 @@ def add_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
     col_map = {c: c.lower() for c in df.columns if c.lower() in ["open", "high", "low", "close", "volume", "datetime", "timestamp", "time"]}
     df = df.rename(col_map)
 
-    # 2. Compute raw indicators
-    df = (
+    # 2. Compute non-collinear raw indicators
+    return (
         df.pipe(add_sma, windows=[50, 200])
-          .pipe(add_ema, spans=[10, 20])
-          .pipe(add_vma, window=20)
           .pipe(add_atr, window=14)
           .pipe(add_rsi, window=14)
-          .pipe(add_macd, fast=12, slow=26, signal=9)
-          .pipe(add_bollinger_bands, window=20, num_std=2)
           .pipe(add_vwap)
+          .fill_null(strategy="backward")
+          .drop_nulls()
     )
-
-    close = pl.col("close")
-    bb_range = (pl.col("BB_Upper") - pl.col("BB_Lower")).clip(lower_bound=1e-8)
-
-    # 3. Derived raw indicators (MACD histogram & Bollinger Band position)
-    df_with_indicators = df.with_columns([
-        (pl.col("MACD") - pl.col("MACD_Signal")).alias("MACD_Hist"),
-        ((close - pl.col("BB_Middle")) / bb_range).alias("BB_Pos"),
-    ]).fill_null(strategy="backward").drop_nulls()
-
-    return df_with_indicators

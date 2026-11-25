@@ -220,6 +220,7 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     extra_config = ckpt["extra_config"]
     model_kwargs = extra_config["model_kwargs"]
+    use_microstructure = extra_config.get("use_microstructure", False)
     use_news = extra_config["use_news"]
 
     pairs_arg = None if args.pair.upper() == "ALL" else [args.pair.upper()]
@@ -231,6 +232,7 @@ def main():
         data_dir=cfg.data_dir,
         min_date=cfg.min_date,
         news_path=cfg.news_path if use_news else None,
+        include_microstructure=use_microstructure,
     )
     assert len(feature_cols) == model_kwargs["input_dim"], (
         f"Feature count mismatch: dataset has {len(feature_cols)}, checkpoint expects {model_kwargs['input_dim']}"
@@ -238,7 +240,7 @@ def main():
 
     model = ITransformer(**model_kwargs).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
-    print(f"Loaded checkpoint: {args.checkpoint} (epoch {ckpt.get('epoch', '?')}) on {device} | use_news={use_news} | arch={model_kwargs}")
+    print(f"Loaded checkpoint: {args.checkpoint} (epoch {ckpt.get('epoch', '?')}) on {device} | use_microstructure={use_microstructure} | use_news={use_news} | arch={model_kwargs}")
 
     evaluate_full_test_split(
         model=model,

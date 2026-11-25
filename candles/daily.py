@@ -7,6 +7,7 @@ import numpy as np
 import polars as pl
 
 from candles.indicators import add_all_indicators
+from candles.microstructure import compute_daily_microstructure
 
 CURRENCIES = ["AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "NZD", "USD"]
 
@@ -45,20 +46,13 @@ CANDLE_FEATURE_COLS = [
     "close",
     "volume",
 
-    # Target pair price-level technical indicators (6) — shared window (p_min, p_range)
+    # Target pair price-level technical indicators (3) — shared window (p_min, p_range)
     "SMA_50",
     "SMA_200",
-    "EMA_10",
-    "EMA_20",
-    "VMA_20",
     "VWAP",
 
-    # Target pair non-price technical indicators (6) — Min-Max scaled per column
+    # Target pair non-price technical indicators (2) — Min-Max scaled per column
     "RSI_14",
-    "MACD",
-    "MACD_Signal",
-    "MACD_Hist",
-    "BB_Pos",
     "ATR_14",
 
     # Correlated cross-pair closes (12): 6 oriented BASE/* + 6 oriented QUOTE/*
@@ -67,8 +61,8 @@ CANDLE_FEATURE_COLS = [
 ]
 
 OHLC_COLS = ("open", "high", "low", "close")
-PRICE_LEVEL_IND_COLS = ("SMA_50", "SMA_200", "EMA_10", "EMA_20", "VMA_20", "VWAP")
-MINMAX_CANDLE_COLS = ("RSI_14", "MACD", "MACD_Signal", "MACD_Hist", "BB_Pos", "ATR_14", *CROSS_COLS)
+PRICE_LEVEL_IND_COLS = ("SMA_50", "SMA_200", "VWAP")
+MINMAX_CANDLE_COLS = ("RSI_14", "ATR_14", *CROSS_COLS)
 
 TARGET_OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 TARGET_CLOSE_IDX = TARGET_OHLCV_COLS.index("close")
@@ -144,14 +138,38 @@ def load_pair_data(pair: str, data_dir: str = "data") -> pl.DataFrame:
 
 
 def resample_to_daily(df_1h: pl.DataFrame) -> pl.DataFrame:
-    """Resamples 1-Hour OHLCV into Daily (1D) candles."""
-    return df_1h.group_by_dynamic("datetime", every="1d").agg([
-        pl.col("open").first(),
-        pl.col("high").max(),
-        pl.col("low").min(),
-        pl.col("close").last(),
-        pl.col("volume").sum(),
-    ]).sort("datetime")
+    """Resamples 1-Hour OHLCV into Daily (1D) candles with intraday daily VWAP."""
+    tp = (
+        pl.col("high").cast(pl.Float64)
+        + pl.col("low").cast(pl.Float64)
+        + pl.col("close").cast(pl.Float64)
+    ) / 3.0
+    vol = pl.col("volume").cast(pl.Float64)
+
+    return (
+        df_1h.with_columns([
+            (tp * vol).alias("_tp_vol"),
+            vol.alias("_vol"),
+        ])
+        .group_by_dynamic("datetime", every="1d")
+        .agg([
+            pl.col("open").first(),
+            pl.col("high").max(),
+            pl.col("low").min(),
+            pl.col("close").last(),
+            pl.col("volume").sum(),
+            pl.col("_tp_vol").sum().alias("_tp_vol_sum"),
+            pl.col("_vol").sum().alias("_vol_sum"),
+        ])
+        .with_columns([
+            pl.when(pl.col("_vol_sum") > 1e-8)
+            .then(pl.col("_tp_vol_sum") / pl.col("_vol_sum"))
+            .otherwise((pl.col("high") + pl.col("low") + pl.col("close")) / 3.0)
+            .alias("VWAP"),
+        ])
+        .drop(["_tp_vol_sum", "_vol_sum"])
+        .sort("datetime")
+    )
 
 
 def compute_daily_features(df_1d: pl.DataFrame) -> pl.DataFrame:
@@ -203,11 +221,13 @@ def attach_oriented_cross_closes(
 def load_daily_candle_maps(
     pairs: list[str],
     data_dir: str = "data",
+    include_microstructure: bool = True,
 ) -> tuple[dict[str, pl.DataFrame], dict[str, pl.DataFrame]]:
     """
     Loads all target pairs and their required cross pairs once, returning
     (daily_ohlcv_map, daily_closes_map).
     """
+    target_pairs = set(pairs)
     needed_pairs = set(pairs)
     for pair in pairs:
         for _, src_pair, _ in get_oriented_cross_specs(pair):
@@ -217,7 +237,10 @@ def load_daily_candle_maps(
     daily_closes_map: dict[str, pl.DataFrame] = {}
     for pair in sorted(needed_pairs):
         try:
-            df_1d = resample_to_daily(load_pair_data(pair, data_dir=data_dir))
+            df_1h = load_pair_data(pair, data_dir=data_dir)
+            df_1d = resample_to_daily(df_1h)
+            if include_microstructure and pair in target_pairs:
+                df_1d = df_1d.join(compute_daily_microstructure(df_1h), on="datetime", how="left")
             daily_ohlcv_map[pair] = df_1d
             daily_closes_map[pair] = df_1d.select(["datetime", "close"])
         except Exception as e:
