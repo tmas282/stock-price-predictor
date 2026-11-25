@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from config import Config
@@ -31,6 +31,7 @@ def train_one_epoch(
     criterion,
     device,
     epoch: int,
+    scheduler=None,
     scaler=None,
     log_interval: int = 250,
 ):
@@ -58,14 +59,18 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+        if scheduler is not None:
+            scheduler.step()
+
         total_loss += loss.item()
 
         if batch_idx % log_interval == 0 or batch_idx == total_batches:
             avg_loss = total_loss / batch_idx
             pct_done = (batch_idx / total_batches) * 100
+            cur_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"  [Epoch {epoch:02d} | Batch {batch_idx:>6}/{total_batches} ({pct_done:5.1f}%)] "
-                f"Batch Loss: {loss.item():.6f} | Running Avg: {avg_loss:.6f}"
+                f"Batch Loss: {loss.item():.6f} | Running Avg: {avg_loss:.6f} | LR: {cur_lr:.6g}"
             )
 
     return total_loss / total_batches
@@ -127,7 +132,7 @@ def main(cfg: Config | None = None):
     print(
         f"Hyperparameters: epochs={cfg.epochs}, batch_size={cfg.batch_size}, "
         f"num_workers={cfg.num_workers}, lr={cfg.learning_rate}, "
-        f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}"
+        f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}, warmup_ratio={cfg.warmup_ratio}"
     )
     print(
         f"Data settings: dir='{cfg.data_dir}', min_date='{cfg.min_date}', "
@@ -182,11 +187,33 @@ def main(cfg: Config | None = None):
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=cfg.epochs,
-        eta_min=cfg.lr_min,
-    )
+    total_steps = max(1, cfg.epochs * len(train_loader))
+    warmup_steps = int(total_steps * cfg.warmup_ratio)
+    if warmup_steps > 0 and warmup_steps < total_steps:
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=1e-3,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps - warmup_steps,
+            eta_min=cfg.lr_min,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps],
+        )
+    else:
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=cfg.lr_min,
+        )
+
+    print(f"LR Schedule: {warmup_steps:,} warmup steps -> {total_steps - warmup_steps:,} cosine decay steps (total={total_steps:,})")
 
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         scaler = None
@@ -209,10 +236,9 @@ def main(cfg: Config | None = None):
 
     print(f"\nStarting multi-pair iTransformer training for {epochs} epochs (Logging every {log_interval} batches)...")
     for epoch in range(1, epochs + 1):
-        current_lr = optimizer.param_groups[0]["lr"]
-        history_lr.append(current_lr)
+        start_lr = optimizer.param_groups[0]["lr"]
 
-        print(f"\n--- Epoch [{epoch:02d}/{epochs:02d}] (LR: {current_lr:.6g}) ---")
+        print(f"\n--- Epoch [{epoch:02d}/{epochs:02d}] (Start LR: {start_lr:.6g}) ---")
         train_loss = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -220,9 +246,11 @@ def main(cfg: Config | None = None):
             criterion=criterion,
             device=device,
             epoch=epoch,
+            scheduler=scheduler,
             scaler=scaler,
             log_interval=log_interval,
         )
+        end_lr = optimizer.param_groups[0]["lr"]
         val_loss, val_acc, val_mae, last_pair_correct, last_pair_total = evaluate(
             model, val_loader, criterion, device
         )
@@ -230,9 +258,7 @@ def main(cfg: Config | None = None):
         history_train_loss.append(train_loss)
         history_val_loss.append(val_loss)
         history_val_acc.append(val_acc)
-
-        scheduler.step()
-        next_lr = optimizer.param_groups[0]["lr"]
+        history_lr.append(end_lr)
 
         print(
             f"End of Epoch {epoch:02d} | "
@@ -240,7 +266,7 @@ def main(cfg: Config | None = None):
             f"Val Loss: {val_loss:.6f} | "
             f"Val Directional Acc: {val_acc:.2f}% | "
             f"Val Price MAE: {val_mae:.5f} | "
-            f"LR: {current_lr:.6g} -> {next_lr:.6g}"
+            f"LR: {start_lr:.6g} -> {end_lr:.6g}"
         )
 
         epoch_path = f"{cfg.checkpoint_dir}/model_epoch_{epoch:02d}.pt"
@@ -249,7 +275,7 @@ def main(cfg: Config | None = None):
             "val_loss": val_loss,
             "val_acc": val_acc,
             "val_mae": val_mae,
-            "lr": current_lr,
+            "lr": end_lr,
         }
         save_model(
             model=model,

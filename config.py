@@ -14,6 +14,7 @@ class Config:
     learning_rate: float = float(os.getenv("LEARNING_RATE", 7e-4))
     weight_decay: float = float(os.getenv("WEIGHT_DECAY", 1e-4))
     lr_min: float = float(os.getenv("LR_MIN", 1e-5))
+    warmup_ratio: float = float(os.getenv("WARMUP_RATIO", 0.10))
 
     data_dir: str = os.getenv("DATA_DIR", "data")
     min_date: str | None = os.getenv("MIN_DATE", "2019-09-22") or None
