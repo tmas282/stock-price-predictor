@@ -1,26 +1,20 @@
+import numpy as np
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
+from candles.daily import TARGET_CLOSE_IDX
 from config import Config
 from dataset import (
-    FEATURE_COLS,
     LEN_1D,
     PRED_DAYS,
-    TARGET_CLOSE_IDX,
     TARGET_DIM,
-    TARGET_HIGH_IDX,
-    TARGET_LOW_IDX,
-    TARGET_OPEN_IDX,
     build_multi_pair_datasets,
 )
 from model.itransformer import ITransformer
 from utils.model_checkpoint import save_model
-from utils.plot_info import (
-    plot_pair_accuracies,
-    plot_training_metrics,
-)
+from utils.plot_info import plot_training_metrics
 from utils.torch_device import get_device
 
 
@@ -40,13 +34,13 @@ def train_one_epoch(
     total_batches = len(dataloader)
 
     for batch_idx, batch in enumerate(dataloader, start=1):
-        x = batch["x"].to(device)                      # (B, 180, feats)
-        target_next = batch["target_next"].to(device)  # (B, 7, 5)
+        x = batch["x"].to(device)                    # (B, 180, feats)
+        target_dir = batch["target_dir"].to(device)  # (B, 7, 1) in {0.0, 1.0}
 
         optimizer.zero_grad()
 
-        pred_next = model(x)                           # (B, 7, 5)
-        loss = criterion(pred_next, target_next.to(pred_next.dtype))
+        logits = model(x)                            # (B, 7, 1) raw logits
+        loss = criterion(logits, target_dir.to(logits.dtype))
 
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -70,57 +64,82 @@ def train_one_epoch(
             cur_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"  [Epoch {epoch:02d} | Batch {batch_idx:>6}/{total_batches} ({pct_done:5.1f}%)] "
-                f"Batch Loss: {loss.item():.6f} | Running Avg: {avg_loss:.6f} | LR: {cur_lr:.6g}"
+                f"BCE Loss: {loss.item():.6f} | Running Avg: {avg_loss:.6f} | LR: {cur_lr:.6g}"
             )
 
     return total_loss / total_batches
 
 
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, conf_margin: float = 0.05):
     model.eval()
     total_loss = 0.0
     correct_direction = 0
     total_samples = 0
-    total_price_error = 0.0
 
-    pair_correct = {}
-    pair_total = {}
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
+
+    hi_conf_correct = 0
+    hi_conf_total = 0
+
+    day_correct = np.zeros(PRED_DAYS, dtype=np.int64)
+    day_total = np.zeros(PRED_DAYS, dtype=np.int64)
 
     with torch.no_grad():
         for batch in dataloader:
             x = batch["x"].to(device)
-            target_next = batch["target_next"].to(device)
-            prev_close = batch["prev_close"].to(device)
-            actual_next_close = batch["actual_next_ohlcv"][:, :, TARGET_CLOSE_IDX].to(device)  # (B, 7)
-            p_min = batch["p_min"].to(device)
-            p_range = batch["p_range"].to(device)
-            pairs = batch["pair"]
+            target_dir = batch["target_dir"].to(device)  # (B, 7, 1)
 
-            pred_next = model(x)  # (B, 7, 5)
-            loss = criterion(pred_next, target_next.to(pred_next.dtype))
+            logits = model(x)                            # (B, 7, 1) raw logits
+            loss = criterion(logits, target_dir.to(logits.dtype))
             total_loss += loss.item()
 
-            # Denormalize predicted nominal close prices across all 7 forecast days: (B, 7)
-            pred_next_close = pred_next[:, :, TARGET_CLOSE_IDX] * p_range.unsqueeze(1) + p_min.unsqueeze(1)
+            probs = torch.sigmoid(logits.float()).squeeze(-1)   # (B, 7)
+            targets = target_dir.float().squeeze(-1)            # (B, 7)
+            preds = (probs >= 0.5).float()
 
-            # Directional accuracy relative to prev_close across all 7 forecast days
-            pred_dir = pred_next_close - prev_close.unsqueeze(1)
-            true_dir = actual_next_close - prev_close.unsqueeze(1)
-            is_correct = (torch.sign(pred_dir) == torch.sign(true_dir)).cpu().numpy()  # (B, 7)
+            pred_up = (preds == 1.0)
+            true_up = (targets == 1.0)
+            tp += int((pred_up & true_up).sum().item())
+            tn += int((~pred_up & ~true_up).sum().item())
+            fp += int((pred_up & ~true_up).sum().item())
+            fn += int((~pred_up & true_up).sum().item())
+
+            is_correct = (preds == targets).cpu().numpy()       # (B, 7) bool
             correct_direction += int(is_correct.sum())
-            total_price_error += torch.abs(pred_next_close - actual_next_close).sum().item()
             total_samples += int(is_correct.size)
 
-            n_days = is_correct.shape[1]
-            for i, p in enumerate(pairs):
-                pair_correct[p] = pair_correct.get(p, 0) + int(is_correct[i].sum())
-                pair_total[p] = pair_total.get(p, 0) + n_days
+            day_correct += is_correct.sum(axis=0)
+            day_total += is_correct.shape[0]
+
+            hi_mask = ((probs - 0.5).abs() >= conf_margin).cpu().numpy()
+            if hi_mask.any():
+                hi_conf_correct += int(is_correct[hi_mask].sum())
+                hi_conf_total += int(hi_mask.sum())
 
     avg_loss = total_loss / len(dataloader)
     dir_acc = (correct_direction / total_samples) * 100 if total_samples > 0 else 0.0
-    mae_price = total_price_error / total_samples if total_samples > 0 else 0.0
+    pred_up_pct = ((tp + fp) / total_samples) * 100 if total_samples > 0 else 0.0
+    true_up_pct = ((tp + fn) / total_samples) * 100 if total_samples > 0 else 0.0
+    up_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    dn_recall = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    bal_acc = 0.5 * (up_recall + dn_recall) * 100
+    hi_conf_acc = (hi_conf_correct / hi_conf_total) * 100 if hi_conf_total > 0 else 0.0
+    hi_conf_cov = (hi_conf_total / total_samples) * 100 if total_samples > 0 else 0.0
+    day_accs = [(day_correct[d] / day_total[d]) * 100 if day_total[d] > 0 else 0.0 for d in range(PRED_DAYS)]
 
-    return avg_loss, dir_acc, mae_price, pair_correct, pair_total
+    return (
+        avg_loss,
+        dir_acc,
+        bal_acc,
+        pred_up_pct,
+        true_up_pct,
+        hi_conf_acc,
+        hi_conf_cov,
+        day_accs,
+    )
 
 
 def main(cfg: Config | None = None):
@@ -135,21 +154,23 @@ def main(cfg: Config | None = None):
         f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}, warmup_ratio={cfg.warmup_ratio}"
     )
     print(
-        f"Data settings: dir='{cfg.data_dir}', min_date='{cfg.min_date}', "
-        f"step_stride={cfg.step_stride}d, plots_dir='{cfg.plots_dir}', "
+        f"Data settings: dir='{cfg.data_dir}', use_news={cfg.use_news}, news_path='{cfg.news_path}', "
+        f"min_date='{cfg.min_date}', step_stride={cfg.step_stride}d, plots_dir='{cfg.plots_dir}', "
         f"checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}"
     )
 
-    # 1. Build Daily (1D) Datasets (T = 180 -> S = 7)
-    train_dataset, val_dataset, test_dataset, loaded_pairs = build_multi_pair_datasets(
+    # 1. Build Cross-Pair Daily (1D) Datasets (T = 180 -> S = 7 binary directions)
+    news_path = cfg.news_path if cfg.use_news else None
+    train_dataset, val_dataset, test_dataset, loaded_pairs, feature_cols = build_multi_pair_datasets(
         train_ratio=cfg.train_ratio,
         val_ratio=cfg.val_ratio,
         step_stride=cfg.step_stride,
         data_dir=cfg.data_dir,
         min_date=cfg.min_date,
+        news_path=news_path,
     )
 
-    print(f"\nLoaded {len(loaded_pairs)} pairs.")
+    print(f"\nLoaded {len(loaded_pairs)} pairs | Input features: {len(feature_cols)}")
     print(f"Total training windows:   {len(train_dataset):,}")
     print(f"Total validation windows: {len(val_dataset):,}")
     print(f"Total test windows:       {len(test_dataset):,}")
@@ -173,20 +194,28 @@ def main(cfg: Config | None = None):
         persistent_workers=(cfg.num_workers > 0),
     )
 
-    # 3. Initialize iTransformer & Mixed Precision
-    model = ITransformer(
-        input_dim=len(FEATURE_COLS),
-        out_dim=TARGET_DIM,
-        T_in_len=LEN_1D,
-        S_out_len=PRED_DAYS,
-    ).to(device)
+    # 3. Initialize iTransformer (out_dim=1 raw logits per day -> BCEWithLogitsLoss)
+    model_kwargs = {
+        "input_dim": len(feature_cols),
+        "out_dim": TARGET_DIM,
+        "T_in_len": LEN_1D,
+        "S_out_len": PRED_DAYS,
+        "n_layers": 2,
+        "token_emb": 128,
+        "input_projection": 32,
+        "ffnn_dim": 256,
+        "nhead": 4,
+        "dropout": 0.5
+    }
+    model = ITransformer(**model_kwargs).to(device)
 
-    criterion = nn.HuberLoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
+
     total_steps = max(1, cfg.epochs * len(train_loader))
     warmup_steps = int(total_steps * cfg.warmup_ratio)
     if warmup_steps > 0 and warmup_steps < total_steps:
@@ -231,10 +260,14 @@ def main(cfg: Config | None = None):
     history_val_acc = []
     history_lr = []
     best_val_loss = float("inf")
-    last_pair_correct: dict[str, int] = {}
-    last_pair_total: dict[str, int] = {}
 
-    print(f"\nStarting multi-pair iTransformer training for {epochs} epochs (Logging every {log_interval} batches)...")
+    extra_config = {
+        "model_kwargs": model_kwargs,
+        "use_news": cfg.use_news,
+        "feature_cols": feature_cols,
+    }
+
+    print(f"\nStarting multi-pair iTransformer BCE direction training for {epochs} epochs (Logging every {log_interval} batches)...")
     for epoch in range(1, epochs + 1):
         start_lr = optimizer.param_groups[0]["lr"]
 
@@ -251,7 +284,7 @@ def main(cfg: Config | None = None):
             log_interval=log_interval,
         )
         end_lr = optimizer.param_groups[0]["lr"]
-        val_loss, val_acc, val_mae, last_pair_correct, last_pair_total = evaluate(
+        val_loss, val_acc, bal_acc, pred_up_pct, true_up_pct, hi_acc, hi_cov, day_accs = evaluate(
             model, val_loader, criterion, device
         )
 
@@ -260,21 +293,30 @@ def main(cfg: Config | None = None):
         history_val_acc.append(val_acc)
         history_lr.append(end_lr)
 
+        day_str = " ".join([f"D{d + 1}:{acc:.1f}%" for d, acc in enumerate(day_accs)])
         print(
             f"End of Epoch {epoch:02d} | "
-            f"Train Loss: {train_loss:.6f} | "
-            f"Val Loss: {val_loss:.6f} | "
-            f"Val Directional Acc: {val_acc:.2f}% | "
-            f"Val Price MAE: {val_mae:.5f} | "
+            f"Train BCE: {train_loss:.6f} | "
+            f"Val BCE: {val_loss:.6f} | "
+            f"Val Acc: {val_acc:.2f}% | "
+            f"Bal Acc: {bal_acc:.2f}% | "
+            f"Pred UP: {pred_up_pct:.1f}% (Actual UP: {true_up_pct:.1f}%) | "
+            f"Hi-Conf(|p-0.5|>=0.05): {hi_acc:.2f}% ({hi_cov:.1f}% cov) | "
             f"LR: {start_lr:.6g} -> {end_lr:.6g}"
         )
+        print(f"  Per-Horizon Val Acc: {day_str}")
 
         epoch_path = f"{cfg.checkpoint_dir}/model_epoch_{epoch:02d}.pt"
         metrics_dict = {
             "train_loss": train_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,
-            "val_mae": val_mae,
+            "bal_acc": bal_acc,
+            "pred_up_pct": pred_up_pct,
+            "true_up_pct": true_up_pct,
+            "hi_conf_acc": hi_acc,
+            "hi_conf_cov": hi_cov,
+            "day_accs": day_accs,
             "lr": end_lr,
         }
         save_model(
@@ -284,6 +326,7 @@ def main(cfg: Config | None = None):
             scheduler=scheduler,
             epoch=epoch,
             metrics=metrics_dict,
+            extra_config=extra_config,
         )
         print(f"  [Checkpoint] Saved -> {epoch_path}")
 
@@ -297,66 +340,43 @@ def main(cfg: Config | None = None):
                 scheduler=scheduler,
                 epoch=epoch,
                 metrics=metrics_dict,
+                extra_config=extra_config,
             )
-            print(f"  [Checkpoint] * New best validation loss! Saved -> {best_path}")
+            print(f"  [Checkpoint] * New best validation BCE! Saved -> {best_path}")
 
-    # 5. Per-Pair Directional Accuracy Summary
-    print("\n--- Per-Pair Validation Performance (Sample) ---")
-    pair_accuracies = {}
-    for pair in loaded_pairs:
-        total = last_pair_total.get(pair, 0)
-        corr = last_pair_correct.get(pair, 0)
-        acc = (corr / total) * 100 if total > 0 else 50.0
-        pair_accuracies[pair] = acc
-
-    for pair in loaded_pairs[:8]:
-        print(f"  {pair:<8}: {pair_accuracies[pair]:5.1f}% accuracy ({last_pair_total.get(pair, 0)} windows)")
-
-    # 6. 7-Day Multi-Pair Inference Demonstration
+    # 5. 7-Day Multi-Pair Direction Inference Demonstration
     model.eval()
     sample_batch = next(iter(val_loader))
     sample_x = sample_batch["x"].to(device)
     sample_prev_close = sample_batch["prev_close"].to(device)
-    sample_actual_ohlcv = sample_batch["actual_next_ohlcv"].to(device)  # (B, 7, 5)
-    sample_actual_close = sample_actual_ohlcv[:, :, TARGET_CLOSE_IDX]   # (B, 7)
-    sample_p_min = sample_batch["p_min"].to(device).unsqueeze(1)
-    sample_p_range = sample_batch["p_range"].to(device).unsqueeze(1)
+    sample_actual_close = sample_batch["actual_next_ohlcv"][:, :, TARGET_CLOSE_IDX].to(device)
+    sample_targets = sample_batch["target_dir"].squeeze(-1)  # (B, 7)
     sample_pairs = sample_batch["pair"]
 
     with torch.no_grad():
-        pred_norm = model(sample_x)  # (B, 7, 5)
-        pred_opens = pred_norm[:, :, TARGET_OPEN_IDX] * sample_p_range + sample_p_min
-        pred_highs = pred_norm[:, :, TARGET_HIGH_IDX] * sample_p_range + sample_p_min
-        pred_lows = pred_norm[:, :, TARGET_LOW_IDX] * sample_p_range + sample_p_min
-        pred_closes = pred_norm[:, :, TARGET_CLOSE_IDX] * sample_p_range + sample_p_min
-
-        predicted_pcts = (pred_closes - sample_prev_close.unsqueeze(1)) / sample_prev_close.unsqueeze(1)
+        probs = torch.sigmoid(model(sample_x).float()).squeeze(-1).cpu()  # (B, 7)
+        preds = (probs >= 0.5).int()
         actual_pcts = (sample_actual_close - sample_prev_close.unsqueeze(1)) / sample_prev_close.unsqueeze(1)
 
-    print("\n--- Multi-Pair Inference Demonstration (Day 1 -> Day 7) ---")
+    print("\n--- Multi-Pair Direction Inference (D+1 -> D+7 Cumulative P(UP)) ---")
     for i in range(min(4, len(sample_pairs))):
         pair = sample_pairs[i]
         p_prev = sample_prev_close[i].item()
+        prob_str = " ".join([f"{probs[i, d].item():.2f}" for d in range(PRED_DAYS)])
+        pred_bits = "".join([str(preds[i, d].item()) for d in range(PRED_DAYS)])
+        true_bits = "".join([str(int(sample_targets[i, d].item())) for d in range(PRED_DAYS)])
         print(
-            f"[{pair}] P(t-1)={p_prev:.4f} | "
-            f"Day1 Pred={pred_closes[i, 0].item():.4f} ({predicted_pcts[i, 0].item():+.3%}) "
-            f"[O:{pred_opens[i, 0].item():.4f} H:{pred_highs[i, 0].item():.4f} L:{pred_lows[i, 0].item():.4f}] "
-            f"Actual={sample_actual_close[i, 0].item():.4f} ({actual_pcts[i, 0].item():+.3%}) | "
-            f"Day7 Pred={pred_closes[i, -1].item():.4f} ({predicted_pcts[i, -1].item():+.3%}) "
-            f"Actual={sample_actual_close[i, -1].item():.4f} ({actual_pcts[i, -1].item():+.3%})"
+            f"[{pair}] P(t)={p_prev:.4f} | P(UP)=[{prob_str}] | "
+            f"Pred={pred_bits} Actual={true_bits} | D+7 Move={actual_pcts[i, -1].item():+.2%}"
         )
 
-    # 7. Generate & Save Diagnostic Plots
+    # 6. Generate & Save Diagnostic Plots
     print(f"\nGenerating and saving plots to '{cfg.plots_dir}'...")
     plot_training_metrics(
         train_losses=history_train_loss,
         val_losses=history_val_loss,
         val_accuracies=history_val_acc,
         learning_rates=history_lr,
-        save_dir=cfg.plots_dir,
-    )
-    plot_pair_accuracies(
-        pair_accuracies=pair_accuracies,
         save_dir=cfg.plots_dir,
     )
 

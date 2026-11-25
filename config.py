@@ -17,7 +17,9 @@ class Config:
     warmup_ratio: float = float(os.getenv("WARMUP_RATIO", 0.10))
 
     data_dir: str = os.getenv("DATA_DIR", "data")
-    min_date: str | None = os.getenv("MIN_DATE", "2019-09-22") or None
+    use_news: bool = os.getenv("USE_NEWS", "true").strip().lower() in {"1", "true", "yes"}
+    news_path: str = os.getenv("NEWS_PATH", "data/news_sentiment.parquet")
+    min_date: str | None = os.getenv("MIN_DATE") or None
     plots_dir: str = os.getenv("PLOTS_DIR", "plots")
     checkpoint_dir: str = os.getenv("CHECKPOINT_DIR", "checkpoints")
     train_ratio: float = float(os.getenv("TRAIN_RATIO", 0.80))

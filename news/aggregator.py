@@ -1,115 +1,152 @@
 from __future__ import annotations
 
-import numpy as np
+from pathlib import Path
+
 import polars as pl
 
 from news.currency_mapper import CURRENCY_LIST
 
-LEN_NEWS_1H = 120  # 5 days * 24 hours
-NEWS_FEATS = 12
+_RAW_NEWS_COLS = ("sentiment", "importance", "p_pos", "p_neg")
+
+NEWS_FEATURE_COLS = [
+    "base_news_sentiment",
+    "base_news_importance",
+    "base_news_p_pos",
+    "base_news_p_neg",
+    "quote_news_sentiment",
+    "quote_news_importance",
+    "quote_news_p_pos",
+    "quote_news_p_neg",
+]
+NEWS_MINMAX_COLS = ("base_news_importance", "quote_news_importance")
 
 
-def compute_sigmoidal_recency(
-    length: int = LEN_NEWS_1H,
-    midpoint: float = 36.0,
-    scale: float = 12.0,
-) -> np.ndarray:
-    """
-    Returns a (length,) float32 curve in chronological order:
-      - oldest (length-1 hours ago) -> ~0.0
-      - newest (0 hours ago)        -> ~1.0
-    """
-    hours_ago = (length - 1) - np.arange(length, dtype=np.float32)
-    return (1.0 / (1.0 + np.exp((hours_ago - midpoint) / scale))).astype(np.float32)
-
-
-def compute_hourly_time_features(datetimes_1h: pl.Series) -> np.ndarray:
-    """
-    Computes (T, 6) cyclical temporal features for each 1H bucket:
-      [hour_sin, hour_cos, dow_sin, dow_cos, week_sin, week_cos]
-    """
-    pi2 = 2.0 * np.pi
-    df_t = pl.DataFrame({"datetime": datetimes_1h}).select([
-        (pi2 * pl.col("datetime").dt.hour() / 24.0).sin().alias("hour_sin"),
-        (pi2 * pl.col("datetime").dt.hour() / 24.0).cos().alias("hour_cos"),
-        (pi2 * (pl.col("datetime").dt.weekday() - 1) / 7.0).sin().alias("dow_sin"),
-        (pi2 * (pl.col("datetime").dt.weekday() - 1) / 7.0).cos().alias("dow_cos"),
-        (pi2 * (pl.col("datetime").dt.week() - 1) / 52.0).sin().alias("week_sin"),
-        (pi2 * (pl.col("datetime").dt.week() - 1) / 52.0).cos().alias("week_cos"),
-    ])
-    return df_t.to_numpy().astype(np.float32)
-
-
-def aggregate_news_to_1h_currencies(
+def aggregate_news_to_1d_currencies(
     df_news: pl.DataFrame,
-    datetimes_1h: pl.Series,
-) -> dict[str, np.ndarray]:
+) -> dict[str, pl.DataFrame]:
     """
-    Causally aggregates scored news (`data/news_sentiment.parquet`) onto the
-    1H candle timeline `datetimes_1h` for each currency in CURRENCY_LIST.
+    Causally aggregates scored news (`data/news_sentiment.parquet`) to Daily (1D)
+    buckets for each currency in CURRENCY_LIST.
 
     Causal rule:
-      A 1H candle labeled `t` covers (t, t + 1h] and closes at `t + 1h`.
-      Any article published at `published_utc` is assigned to
-      `floor_1h(published_utc - 1us)`, so it is only visible once that
-      candle has closed.
+      A 1D candle labeled `D 00:00:00` covers [D 00:00, D+1 00:00) and closes at
+      `D+1 00:00`. Every article published on calendar day `D` (UTC) is known by
+      the close of candle `D`.
 
     Returns:
-      dict[currency, np.ndarray of shape (len(datetimes_1h), 2)]
-      where columns are [weighted_avg_sentiment, log1p_importance_sum].
+      dict[currency, pl.DataFrame] with columns:
+        ['datetime', 'sentiment', 'importance', 'p_pos', 'p_neg']
     """
-    n_steps = len(datetimes_1h)
-    result = {ccy: np.zeros((n_steps, 2), dtype=np.float32) for ccy in CURRENCY_LIST}
+    empty_schema = {
+        "datetime": pl.Datetime("us", "UTC"),
+        "sentiment": pl.Float32,
+        "importance": pl.Float32,
+        "p_pos": pl.Float32,
+        "p_neg": pl.Float32,
+    }
+    if df_news.is_empty():
+        return {ccy: pl.DataFrame(schema=empty_schema) for ccy in CURRENCY_LIST}
 
-    if df_news.is_empty() or n_steps == 0:
-        return result
-
-    target_dtype = datetimes_1h.dtype
-    target_tz = getattr(target_dtype, "time_zone", None)
-
-    # Align published_utc timezone to match datetimes_1h
-    pub = df_news["published_utc"]
-    pub_tz = getattr(pub.dtype, "time_zone", None)
-    if pub_tz is not None and target_tz is None:
-        df_work = df_news.with_columns(pl.col("published_utc").dt.replace_time_zone(None))
-    elif pub_tz is None and target_tz is not None:
-        df_work = df_news.with_columns(pl.col("published_utc").dt.replace_time_zone(target_tz))
-    else:
-        df_work = df_news
-
-    # Map each article to the 1H candle bucket whose close >= published_utc
     df_agg = (
-        df_work.with_columns(
-            (pl.col("published_utc") - pl.duration(microseconds=1))
-            .dt.truncate("1h")
-            .cast(target_dtype)
-            .alias("datetime")
+        df_news.with_columns(
+            pl.col("published_utc").dt.truncate("1d").alias("datetime"),
+            (pl.col("p_pos") * pl.col("importance")).alias("_w_pos"),
+            (pl.col("p_neg") * pl.col("importance")).alias("_w_neg"),
         )
         .group_by(["datetime", "currency"])
         .agg([
             pl.col("weighted_sentiment").sum().alias("_w_sent_sum"),
+            pl.col("_w_pos").sum().alias("_w_pos_sum"),
+            pl.col("_w_neg").sum().alias("_w_neg_sum"),
             pl.col("importance").sum().alias("_imp_sum"),
         ])
         .with_columns([
             pl.when(pl.col("_imp_sum") > 0)
             .then(pl.col("_w_sent_sum") / pl.col("_imp_sum"))
             .otherwise(0.0)
+            .clip(-1.0, 1.0)
             .cast(pl.Float32)
             .alias("sentiment"),
             pl.col("_imp_sum").log1p().cast(pl.Float32).alias("importance"),
+            pl.when(pl.col("_imp_sum") > 0)
+            .then(pl.col("_w_pos_sum") / pl.col("_imp_sum"))
+            .otherwise(0.0)
+            .clip(0.0, 1.0)
+            .cast(pl.Float32)
+            .alias("p_pos"),
+            pl.when(pl.col("_imp_sum") > 0)
+            .then(pl.col("_w_neg_sum") / pl.col("_imp_sum"))
+            .otherwise(0.0)
+            .clip(0.0, 1.0)
+            .cast(pl.Float32)
+            .alias("p_neg"),
         ])
+        .select(["datetime", "currency", "sentiment", "importance", "p_pos", "p_neg"])
+        .sort("datetime")
     )
 
-    base_grid = pl.DataFrame({"datetime": datetimes_1h})
-
+    result: dict[str, pl.DataFrame] = {}
     for ccy in CURRENCY_LIST:
-        df_ccy = df_agg.filter(pl.col("currency") == ccy).select(["datetime", "sentiment", "importance"])
-        if df_ccy.is_empty():
-            continue
-        joined = base_grid.join(df_ccy, on="datetime", how="left").with_columns([
-            pl.col("sentiment").fill_null(0.0).cast(pl.Float32),
-            pl.col("importance").fill_null(0.0).cast(pl.Float32),
-        ])
-        result[ccy] = joined.select(["sentiment", "importance"]).to_numpy().astype(np.float32)
+        df_ccy = df_agg.filter(pl.col("currency") == ccy).drop("currency")
+        result[ccy] = df_ccy if not df_ccy.is_empty() else pl.DataFrame(schema=empty_schema)
 
     return result
+
+
+def load_daily_news_map(news_path: str | Path) -> dict[str, pl.DataFrame]:
+    """Loads scored news Parquet and returns daily per-currency aggregated DataFrames."""
+    path = Path(news_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"News sentiment parquet not found at '{path}'. "
+            "Run news_pipeline.py or disable news with USE_NEWS=false."
+        )
+    return aggregate_news_to_1d_currencies(pl.read_parquet(path))
+
+
+def _align_datetime_dtype(df: pl.DataFrame, target_dtype: pl.DataType) -> pl.DataFrame:
+    """Aligns `df['datetime']` time unit and timezone to `target_dtype`."""
+    src_tz = getattr(df["datetime"].dtype, "time_zone", None)
+    tgt_tz = getattr(target_dtype, "time_zone", None)
+    expr = pl.col("datetime")
+    if src_tz is not None and tgt_tz is None:
+        expr = expr.dt.replace_time_zone(None)
+    elif src_tz is None and tgt_tz is not None:
+        expr = expr.dt.replace_time_zone(tgt_tz)
+    elif src_tz != tgt_tz:
+        expr = expr.dt.convert_time_zone(tgt_tz)
+    return df.with_columns(expr.cast(target_dtype).alias("datetime"))
+
+
+def attach_pair_news(
+    df_target_1d: pl.DataFrame,
+    pair_name: str,
+    daily_news_map: dict[str, pl.DataFrame],
+) -> pl.DataFrame:
+    """
+    Left-joins daily BASE and QUOTE currency news features onto `df_target_1d`,
+    filling days without news with 0.0 so no candle rows are dropped.
+    """
+    base, quote = pair_name[:3], pair_name[3:]
+    dt_type = df_target_1d["datetime"].dtype
+    df_out = df_target_1d
+
+    for prefix, ccy in (("base_news", base), ("quote_news", quote)):
+        df_ccy = daily_news_map.get(ccy)
+        if df_ccy is None or df_ccy.is_empty():
+            df_out = df_out.with_columns([
+                pl.lit(0.0, dtype=pl.Float32).alias(f"{prefix}_{col}")
+                for col in _RAW_NEWS_COLS
+            ])
+            continue
+
+        rename_map = {col: f"{prefix}_{col}" for col in _RAW_NEWS_COLS}
+        df_ccy_aligned = _align_datetime_dtype(
+            df_ccy.select(["datetime", *_RAW_NEWS_COLS]),
+            dt_type,
+        ).rename(rename_map)
+        df_out = df_out.join(df_ccy_aligned, on="datetime", how="left")
+
+    return df_out.with_columns([
+        pl.col(col).fill_null(0.0).cast(pl.Float32) for col in NEWS_FEATURE_COLS
+    ])

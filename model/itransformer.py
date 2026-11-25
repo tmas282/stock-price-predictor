@@ -16,6 +16,7 @@ class ITransformer(nn.Module):
         input_dim: int = 28,
         out_dim: int = 5,
         T_in_len: int = 180,
+        input_projection: int = 64,
         token_emb: int = 256,
         S_out_len: int = 7,
         ffnn_dim: int = 1024,
@@ -24,17 +25,17 @@ class ITransformer(nn.Module):
         dropout: float = 0.2,
     ):
         super().__init__()
-        self.projection_dim = 64
+        self.input_projection = input_projection
         self.token_emb = token_emb
         self.acti_layer = nn.LeakyReLU()
         
-        self.proj_input_candle = ProjectionInput(input_dim, self.projection_dim)
+        self.proj_input = ProjectionInput(input_dim, input_projection)
         self.emb_series_to_var_tokens = nn.Linear(T_in_len, token_emb)
 
         self.transformer_layers = nn.ModuleList([EncoderBlock(token_emb, ffnn_dim=ffnn_dim, num_heads=nhead, dropout=dropout) for _ in range(n_layers)])
 
         self.var_tokens_to_emb_series = nn.Linear(token_emb, S_out_len)
-        self.proj_output_candle = OutputProjection(out_dim, self.projection_dim)
+        self.proj_output = OutputProjection(out_dim, input_projection)
 
     @torch.autocast(device_type="cuda", enabled=torch.cuda.is_available(),
                     dtype=torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16)
@@ -47,7 +48,7 @@ class ITransformer(nn.Module):
         init_dim = x.ndim
         if init_dim == 2:
             x = x.unsqueeze(0)
-        x_proj = self.proj_input_candle(x)
+        x_proj = self.proj_input(x)
         x_hat = torch.transpose(x_proj, 1, 2)
 
         h_i = self.emb_series_to_var_tokens(x_hat)
@@ -61,7 +62,7 @@ class ITransformer(nn.Module):
 
         y = torch.transpose(y_hat, 1, 2)
 
-        y = self.proj_output_candle(y)
+        y = self.proj_output(y)
         if init_dim == 2:
             y = y.squeeze(0)
         return y
