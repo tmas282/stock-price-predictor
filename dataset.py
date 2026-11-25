@@ -6,13 +6,6 @@ import polars as pl
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 from candles.indicators import add_all_indicators
-from news.aggregator import (
-    LEN_NEWS_1H,
-    NEWS_FEATS,
-    aggregate_news_to_1h_currencies,
-    compute_hourly_time_features,
-    compute_sigmoidal_recency,
-)
 
 ALL_PAIRS = [
     # Major Pairs
@@ -27,52 +20,47 @@ ALL_PAIRS = [
     "AUDCAD", "AUDCHF", "AUDNZD", "CADCHF", "NZDCAD", "NZDCHF",
 ]
 
-# Timeframe Lookback Sequence Lengths (Total L = 1440)
-LEN_1D = 180    # 6 months of Daily candles
-LEN_4H = 540    # 3 months of 4-Hour candles (6 candles/day * 90 days)
-LEN_1H = 720    # 30 days of 1-Hour candles (24 candles/day * 30 days)
-TOTAL_L = LEN_1D + LEN_4H + LEN_1H  # 1440 tokens
+# Daily (1D) lookback & forecast horizons
+LEN_1D = 180    # 180 Daily candles (~6 months)
+PRED_DAYS = 7   # Next 7 Daily candles
 
 FEATURE_COLS = [
-    # Cyclical sin/cos temporal features (8)
+    # Cyclical sin/cos daily temporal features (6) — bounded in [-1, 1]
     "month_sin",
     "month_cos",
     "day_sin",
     "day_cos",
-    "hour_open_sin",
-    "hour_open_cos",
-    "hour_end_sin",
-    "hour_end_cos",
+    "dow_sin",
+    "dow_cos",
 
-    # Relative price & volume returns (5)
-    "feat_open_pct",
-    "feat_close_pct",   # Primary close percentage return
-    "feat_high_pct",
-    "feat_low_pct",
-    "feat_volume_pct",
+    # Raw OHLCV (5) — Min-Max scaled per 180-day window
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
 
-    # Timeframe identifier (1.0 = Daily, 2.0 = 4H, 3.0 = 1H)
-    "timeframe_id",
+    # Price-level technical indicators (6) — scaled with shared window (p_min, p_range)
+    "SMA_50",
+    "SMA_200",
+    "EMA_10",
+    "EMA_20",
+    "VMA_20",
+    "VWAP",
 
-    # Technical Indicators from indicators.py (12)
-    "feat_rsi",
-    "feat_macd",
-    "feat_macd_signal",
-    "feat_macd_hist",
-    "feat_bb_pos",
-    "feat_atr",
-    "feat_sma_50",
-    "feat_sma_200",
-    "feat_ema_10",
-    "feat_ema_20",
-    "feat_vma",
-    "feat_vwap",
+    # Non-price technical indicators (6) — Min-Max scaled per column across 180-day window
+    "RSI_14",
+    "MACD",
+    "MACD_Signal",
+    "MACD_Hist",
+    "BB_Pos",
+    "ATR_14",
 ]
 
-# Target next 7 Daily (1D) candles prediction (7 x 5):
-PRED_DAYS = 7
-HOURS_PER_DAY = 24
-PRED_HOURS = PRED_DAYS * HOURS_PER_DAY  # 168 1H candles
+OHLC_COL_IDXS = [FEATURE_COLS.index(c) for c in ("open", "high", "low", "close")]
+VOL_COL_IDX = FEATURE_COLS.index("volume")
+PRICE_LEVEL_IND_IDXS = [FEATURE_COLS.index(c) for c in ("SMA_50", "SMA_200", "EMA_10", "EMA_20", "VMA_20", "VWAP")]
+MINMAX_IND_IDXS = [FEATURE_COLS.index(c) for c in ("RSI_14", "MACD", "MACD_Signal", "MACD_Hist", "BB_Pos", "ATR_14")]
 
 TARGET_COLS = ["open", "high", "low", "close", "volume"]
 TARGET_DIM = len(TARGET_COLS)
@@ -109,11 +97,11 @@ def ensure_datetime_column(df: pl.DataFrame) -> pl.DataFrame:
     return df.sort("datetime")
 
 
-def resample_ohlcv(df_1h: pl.DataFrame, interval: str) -> pl.DataFrame:
+def resample_to_daily(df_1h: pl.DataFrame) -> pl.DataFrame:
     """
-    Resamples 1-Hour OHLCV into higher timeframes (4H or 1D) using Polars dynamic aggregation.
+    Resamples 1-Hour OHLCV into Daily (1D) candles using Polars dynamic aggregation.
     """
-    return df_1h.group_by_dynamic("datetime", every=interval).agg([
+    return df_1h.group_by_dynamic("datetime", every="1d").agg([
         pl.col("open").first(),
         pl.col("high").max(),
         pl.col("low").min(),
@@ -122,45 +110,20 @@ def resample_ohlcv(df_1h: pl.DataFrame, interval: str) -> pl.DataFrame:
     ]).sort("datetime")
 
 
-def compute_timeframe_features(df: pl.DataFrame, timeframe_id: float) -> pl.DataFrame:
+def compute_daily_features(df_1d: pl.DataFrame) -> pl.DataFrame:
     """
-    Computes all technical indicators (indicators.py), cyclical sin/cos temporal features,
-    and stationary relative returns for any timeframe.
+    Computes raw technical indicators and cyclical daily temporal features.
     """
-    # 1. Compute and normalize all technical indicators from indicators.py
-    df = add_all_indicators(df)
-
-    prev_close = pl.col("close").shift(1)
-    prev_vol = pl.col("volume").shift(1)
+    df = add_all_indicators(df_1d)
     pi2 = 2.0 * np.pi
 
-    df = df.with_columns([
-        pl.col("datetime").dt.month().alias("month"),
-        pl.col("datetime").dt.day().alias("day"),
-        pl.col("datetime").dt.hour().alias("hour_open"),
-        ((pl.col("datetime").dt.hour() + 1) % 24).alias("hour_end"),
-    ])
-
     df_featured = df.with_columns([
-        # Cyclical features
-        (pi2 * pl.col("month") / 12.0).sin().alias("month_sin"),
-        (pi2 * pl.col("month") / 12.0).cos().alias("month_cos"),
-        (pi2 * pl.col("day") / 31.0).sin().alias("day_sin"),
-        (pi2 * pl.col("day") / 31.0).cos().alias("day_cos"),
-        (pi2 * pl.col("hour_open") / 24.0).sin().alias("hour_open_sin"),
-        (pi2 * pl.col("hour_open") / 24.0).cos().alias("hour_open_cos"),
-        (pi2 * pl.col("hour_end") / 24.0).sin().alias("hour_end_sin"),
-        (pi2 * pl.col("hour_end") / 24.0).cos().alias("hour_end_cos"),
-
-        # Stationary relative price & volume returns
-        ((pl.col("open") - prev_close) / prev_close).alias("feat_open_pct"),
-        ((pl.col("close") - prev_close) / prev_close).alias("feat_close_pct"),
-        ((pl.col("high") - prev_close) / prev_close).alias("feat_high_pct"),
-        ((pl.col("low") - prev_close) / prev_close).alias("feat_low_pct"),
-        (((pl.col("volume") - prev_vol) / (prev_vol + 1e-8)).clip(-1.0, 1.0)).alias("feat_volume_pct"),
-
-        # Timeframe Tag (1.0 = 1D, 2.0 = 4H, 3.0 = 1H)
-        pl.lit(timeframe_id).alias("timeframe_id"),
+        (pi2 * pl.col("datetime").dt.month() / 12.0).sin().alias("month_sin"),
+        (pi2 * pl.col("datetime").dt.month() / 12.0).cos().alias("month_cos"),
+        (pi2 * pl.col("datetime").dt.day() / 31.0).sin().alias("day_sin"),
+        (pi2 * pl.col("datetime").dt.day() / 31.0).cos().alias("day_cos"),
+        (pi2 * (pl.col("datetime").dt.weekday() - 1) / 7.0).sin().alias("dow_sin"),
+        (pi2 * (pl.col("datetime").dt.weekday() - 1) / 7.0).cos().alias("dow_cos"),
     ]).drop_nulls()
 
     return df_featured
@@ -192,209 +155,107 @@ def load_pair_data(pair: str, data_dir: str = "data") -> pl.DataFrame:
     return ensure_datetime_column(df)
 
 
-class MultiTimeframeDataset(Dataset):
+class DailyDataset(Dataset):
     """
-    Hierarchical Multi-Timeframe Dataset producing context windows of length L = 1440:
-        - 180 Daily (1D) candles
-        - 540 4-Hour (4H) candles
-        - 720 1-Hour (1H) candles
-    
-    Target:
-        - Next 1-Hour candle normalized OHLCV vector of shape (5,):
-          [open, high, low, close, volume] normalized via window Min-Max [0, 1].
+    Daily (1D) sliding-window Dataset for iTransformer:
+        - Input x: (LEN_1D=180, feats=23)
+        - Target:  (PRED_DAYS=7, 5) next 7 Daily [open, high, low, close, volume]
+
+    Normalization:
+        - Computes causal window Min-Max across all 180 Daily input candles:
+          * OHLC (and price-level indicators) share (p_min, p_range)
+          * Volume uses (v_min, v_range)
+          * Non-price indicators are Min-Max scaled per column into [0, 1]
+        - Target is normalized with the exact same (p_min, p_range) and (v_min, v_range).
     """
     def __init__(
         self,
         features_1d: np.ndarray,
-        features_4h: np.ndarray,
-        features_1h: np.ndarray,
-        ohlcv_1h: np.ndarray,
-        win_p_min: np.ndarray,
-        win_p_range: np.ndarray,
-        win_v_min: np.ndarray,
-        win_v_range: np.ndarray,
-        h1_indices: np.ndarray,
-        idx_1d_map: np.ndarray,
-        idx_4h_map: np.ndarray,
+        ohlcv_1d: np.ndarray,
+        d1_indices: np.ndarray,
         pair_name: str,
-        news_base_1h: np.ndarray | None = None,
-        news_quote_1h: np.ndarray | None = None,
-        news_time_1h: np.ndarray | None = None,
-        news_recency: np.ndarray | None = None,
     ):
         super().__init__()
         self.features_1d = features_1d
-        self.features_4h = features_4h
-        self.features_1h = features_1h
-        self.ohlcv_1h = ohlcv_1h
-        self.win_p_min = win_p_min
-        self.win_p_range = win_p_range
-        self.win_v_min = win_v_min
-        self.win_v_range = win_v_range
-        self.h1_indices = h1_indices
-        self.idx_1d_map = idx_1d_map
-        self.idx_4h_map = idx_4h_map
+        self.ohlcv_1d = ohlcv_1d
+        self.d1_indices = d1_indices
         self.pair_name = pair_name
-        self.news_base_1h = news_base_1h
-        self.news_quote_1h = news_quote_1h
-        self.news_time_1h = news_time_1h
-        self.news_recency = news_recency
 
     def __len__(self) -> int:
-        return len(self.h1_indices)
+        return len(self.d1_indices)
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor | str]:
-        h1_idx = self.h1_indices[i]
-        d1_idx = self.idx_1d_map[i]
-        h4_idx = self.idx_4h_map[i]
+        d1_idx = self.d1_indices[i]
 
         # 1. Slice past 180 Daily candles: shape (180, feats)
-        c_1d = self.features_1d[d1_idx - LEN_1D + 1 : d1_idx + 1]
+        x = self.features_1d[d1_idx - LEN_1D + 1 : d1_idx + 1].copy()
 
-        # 2. Slice past 540 4-Hour candles: shape (540, feats)
-        c_4h = self.features_4h[h4_idx - LEN_4H + 1 : h4_idx + 1]
+        # 2. Window Min-Max scaling across all 180 input candles
+        ohlc_vals = x[:, OHLC_COL_IDXS]
+        p_min = float(ohlc_vals.min())
+        p_max = float(ohlc_vals.max())
+        p_range = float(max(p_max - p_min, 1e-8))
 
-        # 3. Slice past 720 1-Hour candles: shape (720, feats)
-        c_1h = self.features_1h[h1_idx - LEN_1H + 1 : h1_idx + 1]
+        vol_vals = x[:, VOL_COL_IDX]
+        v_min = float(vol_vals.min())
+        v_max = float(vol_vals.max())
+        v_range = float(max(v_max - v_min, 1e-8))
 
-        # 4. Concatenate along time: Total sequence length L = 180 + 540 + 720 = 1440
-        x = np.concatenate([c_1d, c_4h, c_1h], axis=0)
+        x[:, OHLC_COL_IDXS] = (ohlc_vals - p_min) / p_range
+        x[:, PRICE_LEVEL_IND_IDXS] = np.clip((x[:, PRICE_LEVEL_IND_IDXS] - p_min) / p_range, -5.0, 5.0)
+        x[:, VOL_COL_IDX] = (vol_vals - v_min) / v_range
 
-        # 5. Target: Next 7 Daily (1D = 24h) candles normalized OHLCV: shape (7, 5)
-        future_1h = self.ohlcv_1h[h1_idx + 1 : h1_idx + 1 + PRED_HOURS].reshape(
-            PRED_DAYS, HOURS_PER_DAY, 5
-        )
-        next_ohlcv = np.empty((PRED_DAYS, 5), dtype=np.float32)
-        next_ohlcv[:, 0] = future_1h[:, 0, 0]                # open
-        next_ohlcv[:, 1] = future_1h[:, :, 1].max(axis=1)    # high
-        next_ohlcv[:, 2] = future_1h[:, :, 2].min(axis=1)    # low
-        next_ohlcv[:, 3] = future_1h[:, -1, 3]               # close
-        next_ohlcv[:, 4] = future_1h[:, :, 4].sum(axis=1)    # volume
+        ind_vals = x[:, MINMAX_IND_IDXS]
+        ind_min = ind_vals.min(axis=0)
+        ind_max = ind_vals.max(axis=0)
+        ind_range = np.maximum(ind_max - ind_min, 1e-8)
+        x[:, MINMAX_IND_IDXS] = (ind_vals - ind_min) / ind_range
 
-        p_min = self.win_p_min[h1_idx]
-        p_range = self.win_p_range[h1_idx]
-        v_min = self.win_v_min[h1_idx]
-        v_range = self.win_v_range[h1_idx]
-
-        target_next = np.empty((PRED_DAYS, 5), dtype=np.float32)
+        # 3. Target: Next 7 Daily candles normalized with the SAME input Min-Max
+        next_ohlcv = self.ohlcv_1d[d1_idx + 1 : d1_idx + 1 + PRED_DAYS].copy()
+        target_next = np.empty((PRED_DAYS, TARGET_DIM), dtype=np.float32)
         target_next[:, 0:4] = (next_ohlcv[:, 0:4] - p_min) / p_range
-        target_next[:, 4] = ((next_ohlcv[:, 4] / HOURS_PER_DAY) - v_min) / v_range
+        target_next[:, 4] = (next_ohlcv[:, 4] - v_min) / v_range
         target_next = np.clip(target_next, -5.0, 5.0)
 
-        prev_close = self.ohlcv_1h[h1_idx, 3]
-
-        # 6. Slice past 120 hours (5 days) of causal news features: shape (120, 12)
-        if (
-            self.news_base_1h is not None
-            and self.news_quote_1h is not None
-            and self.news_time_1h is not None
-            and self.news_recency is not None
-        ):
-            n_start = h1_idx - LEN_NEWS_1H + 1
-            n_end = h1_idx + 1
-            base_s = self.news_base_1h[n_start:n_end]    # (120, 2): [sent, imp]
-            quote_s = self.news_quote_1h[n_start:n_end]  # (120, 2): [sent, imp]
-            rel_sent = base_s[:, 0:1] - quote_s[:, 0:1]
-            recency = self.news_recency[:, None]
-            time_s = self.news_time_1h[n_start:n_end]    # (120, 6)
-            news = np.concatenate(
-                [
-                    base_s[:, 0:1],
-                    quote_s[:, 0:1],
-                    rel_sent,
-                    base_s[:, 1:2],
-                    quote_s[:, 1:2],
-                    recency,
-                    time_s,
-                ],
-                axis=1,
-            ).astype(np.float32)
-        else:
-            news = np.zeros((LEN_NEWS_1H, NEWS_FEATS), dtype=np.float32)
+        prev_close = self.ohlcv_1d[d1_idx, 3]
 
         return {
-            "x": torch.from_numpy(x),                                     # (1440, feats)
-            "news": torch.from_numpy(news),                               # (120, news_feats)
-            "target_next": torch.from_numpy(target_next),                 # (5,)
-            "actual_next_ohlcv": torch.from_numpy(next_ohlcv),           # (5,)
+            "x": torch.from_numpy(x),                                     # (180, feats)
+            "target_next": torch.from_numpy(target_next),                 # (7, 5)
+            "actual_next_ohlcv": torch.from_numpy(next_ohlcv),            # (7, 5)
             "prev_close": torch.tensor(prev_close, dtype=torch.float32),  # scalar
             "p_min": torch.tensor(p_min, dtype=torch.float32),            # scalar
             "p_range": torch.tensor(p_range, dtype=torch.float32),        # scalar
             "v_min": torch.tensor(v_min, dtype=torch.float32),            # scalar
             "v_range": torch.tensor(v_range, dtype=torch.float32),        # scalar
-            "pair": self.pair_name
+            "pair": self.pair_name,
         }
 
 
-def process_pair_multi_timeframe(
+def process_pair_daily(
     df_raw: pl.DataFrame,
     pair_name: str,
-    train_ratio: float = 0.70,
-    val_ratio: float = 0.15,
-    step_stride: int = 4,
-    news_df: pl.DataFrame | None = None,
+    train_ratio: float = 0.80,
+    val_ratio: float = 0.10,
+    step_stride: int = 1,
     min_date: str | None = None,
-) -> tuple[MultiTimeframeDataset, MultiTimeframeDataset, MultiTimeframeDataset] | None:
+) -> tuple[DailyDataset, DailyDataset, DailyDataset] | None:
     """
-    Resamples 1H data into 4H and 1D, computes features, performs strictly causal
-    timeframe alignment via join_asof, and builds sequential train/val/test datasets.
+    Resamples 1H data into Daily (1D), computes features, and builds
+    sequential train/val/test DailyDatasets.
     """
-    # 1. Resample to 4H and 1D
-    df_4h_raw = resample_ohlcv(df_raw, "4h")
-    df_1d_raw = resample_ohlcv(df_raw, "1d")
-
-    # 2. Compute features for each timeframe
-    df_1h = compute_timeframe_features(df_raw, timeframe_id=3.0)
-    df_4h = compute_timeframe_features(df_4h_raw, timeframe_id=2.0)
-    df_1d = compute_timeframe_features(df_1d_raw, timeframe_id=1.0)
-
-    # 3. Compute rolling window min/max for 1H price and volume normalization
-    df_1h = df_1h.with_columns([
-        pl.col("low").rolling_min(window_size=LEN_1H).alias("win_p_min"),
-        pl.col("high").rolling_max(window_size=LEN_1H).alias("win_p_max"),
-        pl.col("volume").rolling_min(window_size=LEN_1H).alias("win_v_min"),
-        pl.col("volume").rolling_max(window_size=LEN_1H).alias("win_v_max"),
-    ])
-
-    # 4. Add closed_at and row index for causal alignment
-    # Match the exact datetime dtype to prevent Polars SchemaError in join_asof
-    dt_type = df_1h["datetime"].dtype
-    df_1d = df_1d.with_columns([
-        (pl.col("datetime") + pl.duration(days=1)).cast(dt_type).alias("closed_at"),
-        pl.int_range(0, pl.len()).alias("idx_1d")
-    ])
-    df_4h = df_4h.with_columns([
-        (pl.col("datetime") + pl.duration(hours=4)).cast(dt_type).alias("closed_at"),
-        pl.int_range(0, pl.len()).alias("idx_4h")
-    ])
-
-    # 5. Causal join_asof: match 1H candle with the latest CLOSED 1D and 4H candle
-    df_aligned = df_1h.join_asof(
-        df_1d.select(["closed_at", "idx_1d"]),
-        left_on="datetime",
-        right_on="closed_at",
-        strategy="backward"
-    ).join_asof(
-        df_4h.select(["closed_at", "idx_4h"]),
-        left_on="datetime",
-        right_on="closed_at",
-        strategy="backward"
-    ).with_columns(
-        pl.int_range(0, pl.len()).alias("h1_idx")
+    df_1d = compute_daily_features(resample_to_daily(df_raw)).with_columns(
+        pl.int_range(0, pl.len()).alias("d1_idx")
     )
 
-    # 6. Filter valid indices with full lookback:
-    # Need 180 1D candles, 540 4H candles, 720 1H candles, and 7*24 forward 1H candles for target
-    valid_df = df_aligned.filter(
-        (pl.col("idx_1d") >= LEN_1D - 1) &
-        (pl.col("idx_4h") >= LEN_4H - 1) &
-        (pl.col("h1_idx") >= LEN_1H - 1) &
-        (pl.col("h1_idx") < len(df_1h) - PRED_HOURS)
+    valid_df = df_1d.filter(
+        (pl.col("d1_idx") >= LEN_1D - 1) &
+        (pl.col("d1_idx") < len(df_1d) - PRED_DAYS)
     )
 
-    # Optional start-date filter applied AFTER lookback alignment so the earliest
-    # window still retains its full 180D / 540x4H / 720x1H price history.
     if min_date:
+        dt_type = df_1d["datetime"].dtype
         min_dt = datetime.fromisoformat(min_date)
         dt_tz = getattr(dt_type, "time_zone", None)
         if dt_tz is not None and min_dt.tzinfo is None:
@@ -403,111 +264,53 @@ def process_pair_multi_timeframe(
             min_dt = min_dt.astimezone(timezone.utc).replace(tzinfo=None)
         valid_df = valid_df.filter(pl.col("datetime") >= pl.lit(min_dt).cast(dt_type))
 
-    if len(valid_df) < 100:
+    if len(valid_df) < 30:
         return None
 
-    # Pre-extract arrays for zero-copy numpy slicing in DataLoader
     feats_1d = df_1d.select(FEATURE_COLS).to_numpy().astype(np.float32)
-    feats_4h = df_4h.select(FEATURE_COLS).to_numpy().astype(np.float32)
-    feats_1h = df_1h.select(FEATURE_COLS).to_numpy().astype(np.float32)
+    ohlcv_1d = df_1d.select(TARGET_COLS).to_numpy().astype(np.float32)
+    d1_indices = valid_df.select("d1_idx").to_numpy().flatten()[::step_stride]
 
-    ohlcv_1h = df_1h.select(["open", "high", "low", "close", "volume"]).to_numpy().astype(np.float32)
-    win_p_min = df_1h.select("win_p_min").to_numpy().astype(np.float32).flatten()
-    win_p_max = df_1h.select("win_p_max").to_numpy().astype(np.float32).flatten()
-    win_p_range = np.maximum(win_p_max - win_p_min, 1e-8).astype(np.float32)
-
-    win_v_min = df_1h.select("win_v_min").to_numpy().astype(np.float32).flatten()
-    win_v_max = df_1h.select("win_v_max").to_numpy().astype(np.float32).flatten()
-    win_v_range = np.maximum(win_v_max - win_v_min, 1.0).astype(np.float32)
-
-    # Apply step_stride (e.g. sample every 4 hours instead of every 1 hour to reduce 99.9% redundant overlap)
-    h1_indices = valid_df.select("h1_idx").to_numpy().flatten()[::step_stride]
-    idx_1d_map = valid_df.select("idx_1d").to_numpy().flatten()[::step_stride]
-    idx_4h_map = valid_df.select("idx_4h").to_numpy().flatten()[::step_stride]
-
-    # Causal 5-day (120h) news arrays aligned to df_1h["datetime"]
-    news_base_1h = None
-    news_quote_1h = None
-    news_time_1h = None
-    news_recency = None
-    if news_df is not None and not news_df.is_empty():
-        base_ccy, quote_ccy = pair_name[:3], pair_name[3:]
-        ccy_arrays = aggregate_news_to_1h_currencies(news_df, df_1h["datetime"])
-        news_base_1h = ccy_arrays.get(base_ccy)
-        news_quote_1h = ccy_arrays.get(quote_ccy)
-        news_time_1h = compute_hourly_time_features(df_1h["datetime"])
-        news_recency = compute_sigmoidal_recency(LEN_NEWS_1H)
-
-    # 7. Sequential train / val / test split
-    total = len(h1_indices)
+    total = len(d1_indices)
     train_end = int(total * train_ratio)
     val_end = int(total * (train_ratio + val_ratio))
 
-    def make_sub_dataset(start: int, end: int):
-        return MultiTimeframeDataset(
-            features_1d=feats_1d,
-            features_4h=feats_4h,
-            features_1h=feats_1h,
-            ohlcv_1h=ohlcv_1h,
-            win_p_min=win_p_min,
-            win_p_range=win_p_range,
-            win_v_min=win_v_min,
-            win_v_range=win_v_range,
-            h1_indices=h1_indices[start:end],
-            idx_1d_map=idx_1d_map[start:end],
-            idx_4h_map=idx_4h_map[start:end],
-            pair_name=pair_name,
-            news_base_1h=news_base_1h,
-            news_quote_1h=news_quote_1h,
-            news_time_1h=news_time_1h,
-            news_recency=news_recency,
-        )
-
-    train_ds = make_sub_dataset(0, train_end)
-    val_ds = make_sub_dataset(train_end, val_end)
-    test_ds = make_sub_dataset(val_end, total)
+    train_ds = DailyDataset(feats_1d, ohlcv_1d, d1_indices[:train_end], pair_name)
+    val_ds = DailyDataset(feats_1d, ohlcv_1d, d1_indices[train_end:val_end], pair_name)
+    test_ds = DailyDataset(feats_1d, ohlcv_1d, d1_indices[val_end:], pair_name)
 
     return train_ds, val_ds, test_ds
 
 
 def build_multi_pair_datasets(
     pairs: list[str] | None = None,
-    train_ratio: float = 0.70,
-    val_ratio: float = 0.15,
-    step_stride: int = 4,
+    train_ratio: float = 0.80,
+    val_ratio: float = 0.10,
+    step_stride: int = 1,
     data_dir: str = "data",
-    news_path: str | None = "data/news_sentiment.parquet",
     min_date: str | None = None,
 ) -> tuple[ConcatDataset, ConcatDataset, ConcatDataset, list[str]]:
     """
-    Builds unified multi-pair datasets with context length L = 1440 across all specified pairs.
+    Builds unified multi-pair Daily (1D) datasets across all specified pairs.
     """
     if pairs is None:
         pairs = ALL_PAIRS
-
-    news_df: pl.DataFrame | None = None
-    if news_path and os.path.exists(news_path):
-        news_df = pl.read_parquet(news_path)
-        print(f"Loaded {len(news_df):,} scored news rows from '{news_path}'.")
-    else:
-        print(f"No news cache found at '{news_path}'; using zero-filled news tensors.")
 
     train_sets = []
     val_sets = []
     test_sets = []
     loaded_pairs = []
 
-    print(f"Building Multi-Timeframe Datasets (L = {TOTAL_L} tokens: 180 1D + 540 4H + 720 1H | Stride: {step_stride}h) across {len(pairs)} pairs...")
+    print(f"Building Daily (1D) Datasets (T = {LEN_1D} days -> S = {PRED_DAYS} days | Stride: {step_stride}d) across {len(pairs)} pairs...")
     for pair in pairs:
         try:
             df_raw = load_pair_data(pair, data_dir=data_dir)
-            res = process_pair_multi_timeframe(
+            res = process_pair_daily(
                 df_raw=df_raw,
                 pair_name=pair,
                 train_ratio=train_ratio,
                 val_ratio=val_ratio,
                 step_stride=step_stride,
-                news_df=news_df,
                 min_date=min_date,
             )
             if res is None:
@@ -522,6 +325,6 @@ def build_multi_pair_datasets(
             print(f"Skipping {pair}: {e}")
 
     if not train_sets:
-        raise RuntimeError("No valid multi-timeframe datasets could be built.")
+        raise RuntimeError("No valid daily datasets could be built.")
 
     return ConcatDataset(train_sets), ConcatDataset(val_sets), ConcatDataset(test_sets), loaded_pairs

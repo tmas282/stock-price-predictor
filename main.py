@@ -6,17 +6,16 @@ from torch.utils.data import DataLoader
 from config import Config
 from dataset import (
     FEATURE_COLS,
-    NEWS_FEATS,
-    TARGET_COLS,
+    LEN_1D,
+    PRED_DAYS,
+    TARGET_CLOSE_IDX,
     TARGET_DIM,
-    TARGET_OPEN_IDX,
     TARGET_HIGH_IDX,
     TARGET_LOW_IDX,
-    TARGET_CLOSE_IDX,
-    TARGET_VOLUME_IDX,
+    TARGET_OPEN_IDX,
     build_multi_pair_datasets,
 )
-from model.transformer import SelfSupervisedTransformer
+from model.itransformer import ITransformer
 from utils.model_checkpoint import save_model
 from utils.plot_info import (
     plot_pair_accuracies,
@@ -40,26 +39,27 @@ def train_one_epoch(
     total_batches = len(dataloader)
 
     for batch_idx, batch in enumerate(dataloader, start=1):
-        x = batch["x"].to(device)                      # (B, L, feats)
-        news = batch["news"].to(device)                # (B, 120, news_feats)
-        target_next = batch["target_next"].to(device)  # (B, out_feats=5)
+        x = batch["x"].to(device)                      # (B, 180, feats)
+        target_next = batch["target_next"].to(device)  # (B, 7, 5)
 
         optimizer.zero_grad()
 
-        pred_next = model(x, news)                     # (B, 5)
+        pred_next = model(x)                           # (B, 7, 5)
         loss = criterion(pred_next, target_next.to(pred_next.dtype))
 
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         total_loss += loss.item()
 
-        # Periodically log batch progress
         if batch_idx % log_interval == 0 or batch_idx == total_batches:
             avg_loss = total_loss / batch_idx
             pct_done = (batch_idx / total_batches) * 100
@@ -84,7 +84,6 @@ def evaluate(model, dataloader, criterion, device):
     with torch.no_grad():
         for batch in dataloader:
             x = batch["x"].to(device)
-            news = batch["news"].to(device)
             target_next = batch["target_next"].to(device)
             prev_close = batch["prev_close"].to(device)
             actual_next_close = batch["actual_next_ohlcv"][:, :, TARGET_CLOSE_IDX].to(device)  # (B, 7)
@@ -92,7 +91,7 @@ def evaluate(model, dataloader, criterion, device):
             p_range = batch["p_range"].to(device)
             pairs = batch["pair"]
 
-            pred_next = model(x, news)  # (B, 7, 5)
+            pred_next = model(x)  # (B, 7, 5)
             loss = criterion(pred_next, target_next.to(pred_next.dtype))
             total_loss += loss.item()
 
@@ -130,15 +129,18 @@ def main(cfg: Config | None = None):
         f"num_workers={cfg.num_workers}, lr={cfg.learning_rate}, "
         f"weight_decay={cfg.weight_decay}, lr_min={cfg.lr_min}"
     )
-    print(f"Data settings: dir='{cfg.data_dir}', min_date='{cfg.min_date}', step_stride={cfg.step_stride}h, plots_dir='{cfg.plots_dir}', checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}")
+    print(
+        f"Data settings: dir='{cfg.data_dir}', min_date='{cfg.min_date}', "
+        f"step_stride={cfg.step_stride}d, plots_dir='{cfg.plots_dir}', "
+        f"checkpoint_dir='{cfg.checkpoint_dir}', train_ratio={cfg.train_ratio}, val_ratio={cfg.val_ratio}"
+    )
 
-    # 1. Build Hierarchical Multi-Timeframe Datasets (L = 1440)
+    # 1. Build Daily (1D) Datasets (T = 180 -> S = 7)
     train_dataset, val_dataset, test_dataset, loaded_pairs = build_multi_pair_datasets(
         train_ratio=cfg.train_ratio,
         val_ratio=cfg.val_ratio,
         step_stride=cfg.step_stride,
         data_dir=cfg.data_dir,
-        news_path=cfg.news_path,
         min_date=cfg.min_date,
     )
 
@@ -166,29 +168,26 @@ def main(cfg: Config | None = None):
         persistent_workers=(cfg.num_workers > 0),
     )
 
-    # 3. Initialize Transformer & Mixed Precision
-    model = SelfSupervisedTransformer(
-        feats=len(FEATURE_COLS),
-        news_feats=NEWS_FEATS,
-        out_feats=TARGET_DIM,
+    # 3. Initialize iTransformer & Mixed Precision
+    model = ITransformer(
+        input_dim=len(FEATURE_COLS),
+        out_dim=TARGET_DIM,
+        T_in_len=LEN_1D,
+        S_out_len=PRED_DAYS,
     ).to(device)
 
     criterion = nn.HuberLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay
+        weight_decay=cfg.weight_decay,
     )
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=cfg.epochs,
-        eta_min=cfg.lr_min
+        eta_min=cfg.lr_min,
     )
 
-    # Dynamic Mixed Precision & GradScaler Setup:
-    # - RTX 30xx/40xx (Ampere/Ada) GPUs natively support bfloat16: no GradScaler needed
-    # - Older GPUs (Volta/Turing) use float16: GradScaler prevents underflow
-    # - CPU runs standard float32
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         scaler = None
     elif torch.cuda.is_available():
@@ -196,10 +195,9 @@ def main(cfg: Config | None = None):
     else:
         scaler = None
 
-    # Automatically adapt log interval so it logs ~10 to 20 times per epoch
     log_interval = max(50, len(train_loader) // 20)
 
-    # 4. Self-Supervised Training Loop
+    # 4. Training Loop
     epochs = cfg.epochs
     history_train_loss = []
     history_val_loss = []
@@ -209,7 +207,7 @@ def main(cfg: Config | None = None):
     last_pair_correct: dict[str, int] = {}
     last_pair_total: dict[str, int] = {}
 
-    print(f"\nStarting multi-pair self-supervised training for {epochs} epochs (Logging every {log_interval} batches)...")
+    print(f"\nStarting multi-pair iTransformer training for {epochs} epochs (Logging every {log_interval} batches)...")
     for epoch in range(1, epochs + 1):
         current_lr = optimizer.param_groups[0]["lr"]
         history_lr.append(current_lr)
@@ -223,15 +221,16 @@ def main(cfg: Config | None = None):
             device=device,
             epoch=epoch,
             scaler=scaler,
-            log_interval=log_interval
+            log_interval=log_interval,
         )
-        val_loss, val_acc, val_mae, last_pair_correct, last_pair_total = evaluate(model, val_loader, criterion, device)
-        
+        val_loss, val_acc, val_mae, last_pair_correct, last_pair_total = evaluate(
+            model, val_loader, criterion, device
+        )
+
         history_train_loss.append(train_loss)
         history_val_loss.append(val_loss)
         history_val_acc.append(val_acc)
 
-        # Step CosineAnnealingLR scheduler after each epoch
         scheduler.step()
         next_lr = optimizer.param_groups[0]["lr"]
 
@@ -244,7 +243,6 @@ def main(cfg: Config | None = None):
             f"LR: {current_lr:.6g} -> {next_lr:.6g}"
         )
 
-        # Save checkpoint after every epoch
         epoch_path = f"{cfg.checkpoint_dir}/model_epoch_{epoch:02d}.pt"
         metrics_dict = {
             "train_loss": train_loss,
@@ -263,7 +261,6 @@ def main(cfg: Config | None = None):
         )
         print(f"  [Checkpoint] Saved -> {epoch_path}")
 
-        # Save copy if best validation loss achieved
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = f"{cfg.checkpoint_dir}/best_model.pt"
@@ -293,7 +290,6 @@ def main(cfg: Config | None = None):
     model.eval()
     sample_batch = next(iter(val_loader))
     sample_x = sample_batch["x"].to(device)
-    sample_news = sample_batch["news"].to(device)
     sample_prev_close = sample_batch["prev_close"].to(device)
     sample_actual_ohlcv = sample_batch["actual_next_ohlcv"].to(device)  # (B, 7, 5)
     sample_actual_close = sample_actual_ohlcv[:, :, TARGET_CLOSE_IDX]   # (B, 7)
@@ -302,7 +298,7 @@ def main(cfg: Config | None = None):
     sample_pairs = sample_batch["pair"]
 
     with torch.no_grad():
-        pred_norm = model(sample_x, sample_news)  # (B, 7, 5)
+        pred_norm = model(sample_x)  # (B, 7, 5)
         pred_opens = pred_norm[:, :, TARGET_OPEN_IDX] * sample_p_range + sample_p_min
         pred_highs = pred_norm[:, :, TARGET_HIGH_IDX] * sample_p_range + sample_p_min
         pred_lows = pred_norm[:, :, TARGET_LOW_IDX] * sample_p_range + sample_p_min

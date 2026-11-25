@@ -62,8 +62,7 @@ def add_vwap(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Computes all technical indicators and scales them into stationary,
-    scale-invariant features suitable for neural network input across all asset pairs.
+    Computes all raw technical indicators for downstream window Min-Max scaling.
     """
     # 1. Standardize column names to lowercase
     col_map = {c: c.lower() for c in df.columns if c.lower() in ["open", "high", "low", "close", "volume", "datetime", "timestamp", "time"]}
@@ -84,29 +83,10 @@ def add_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
     close = pl.col("close")
     bb_range = (pl.col("BB_Upper") - pl.col("BB_Lower")).clip(lower_bound=1e-8)
 
-    # 3. Create scale-invariant normalized feature columns
-    df_normalized = df.with_columns([
-        # RSI centered at 0: [-1.0, +1.0]
-        ((pl.col("RSI_14") - 50.0) / 50.0).clip(-1.0, 1.0).alias("feat_rsi"),
-
-        # MACD relative to price
-        ((pl.col("MACD") / close) * 100.0).clip(-1.0, 1.0).alias("feat_macd"),
-        ((pl.col("MACD_Signal") / close) * 100.0).clip(-1.0, 1.0).alias("feat_macd_signal"),
-        (((pl.col("MACD") - pl.col("MACD_Signal")) / close) * 100.0).clip(-1.0, 1.0).alias("feat_macd_hist"),
-
-        # Bollinger Bands %B position: [-1.0, +1.0]
-        (((close - pl.col("BB_Middle")) / bb_range) * 2.0).clip(-2.0, 2.0).alias("feat_bb_pos"),
-
-        # Relative volatility: ATR / price
-        ((pl.col("ATR_14") / close) * 50.0).clip(0.0, 2.0).alias("feat_atr"),
-
-        # Moving average relative distances: (Close - MA) / MA
-        (((close - pl.col("SMA_50")) / pl.col("SMA_50")) * 20.0).clip(-1.0, 1.0).alias("feat_sma_50"),
-        (((close - pl.col("SMA_200")) / pl.col("SMA_200")) * 20.0).clip(-1.0, 1.0).alias("feat_sma_200"),
-        (((close - pl.col("EMA_10")) / pl.col("EMA_10")) * 50.0).clip(-1.0, 1.0).alias("feat_ema_10"),
-        (((close - pl.col("EMA_20")) / pl.col("EMA_20")) * 50.0).clip(-1.0, 1.0).alias("feat_ema_20"),
-        (((close - pl.col("VMA_20")) / pl.col("VMA_20")) * 20.0).clip(-1.0, 1.0).alias("feat_vma"),
-        (((close - pl.col("VWAP")) / pl.col("VWAP")) * 20.0).clip(-1.0, 1.0).alias("feat_vwap"),
+    # 3. Derived raw indicators (MACD histogram & Bollinger Band position)
+    df_with_indicators = df.with_columns([
+        (pl.col("MACD") - pl.col("MACD_Signal")).alias("MACD_Hist"),
+        ((close - pl.col("BB_Middle")) / bb_range).alias("BB_Pos"),
     ]).fill_null(strategy="backward").drop_nulls()
 
-    return df_normalized
+    return df_with_indicators
